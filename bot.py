@@ -1,306 +1,426 @@
-"""Exp 2: Pure Stealth / Zero-Fire Cover Survival Probe for Mech Royale."""
+"""Oval Circuit, a placement-oriented controller for the Mech Royale arena."""
 import math
 import random
-import sys
-import traceback
 
 import mechfight
 from arena import Arena
-from combat import DefensiveAim
+from combat import Combat
 from tactics import Footwork, distance, future_ring, inside_goal, unit
 
 
 class Bot:
-    name = "Oval Stealth-v2"
+    name = "Oval Circuit-exp3"
 
     def __init__(self, hello):
-        self.cfg = hello.get("config", {})
-        self.rng = random.Random(int(hello.get("seed", 0)))
-        self.arena = None
-        try:
-            self.arena = Arena(hello)
-        except Exception:
-            print(f"Arena init failed:\n{traceback.format_exc()}", file=sys.stderr, flush=True)
-        self.aim = DefensiveAim(hello)
+        self.cfg = hello["config"]
+        self.rng = random.Random(hello["seed"])
+        self.arena = Arena(hello)
+        self.combat = Combat(hello)
         self.feet = Footwork(hello)
-
-        self.last_damage = -99.0
-        self.last_seen_enemy = -99.0
+        self.items = {}
+        self.enemy_hp = {}
+        self.enemy_hurt = {}
+        self.route_budget = (None, -1, 0.0)
+        self.skip_until = {}
+        self.item_goal = None
+        self.item_check = None
+        self.last_damage = -99
         self.damage_source = None
-        self.recent_enemies = {}   # id -> (pos, t, cubes)
-        self.danger_sounds = []    # list of (t, bearing, weight)
+        self.recovering = False
         self.shelter = None
-        self.shelter_until = -1.0
-        self.hide_goal = None
-        self.hide_zone_key = None
-        self.hide_until = -1.0
-        self.route_budget = (None, -1.0, 0.0)
-        self.mode = "hide"
+        self.shelter_until = -1
+        self.hold = None
+        self.hold_until = -1
+        self.waypoint = None
+        self.waypoint_until = -1
+        self.visits = {}
+        self.mode = "explore"
 
-    def _remember(self, obs):
-        t = obs["t"]
-        me = obs["self"]
+    def remember(self, obs):
+        t, me = obs["t"], obs["self"]
         pos = me["pos"]
-        for e in obs.get("events", []):
-            if e.get("type") == "damaged" and e.get("weapon") != "zone":
+        seen = set()
+        for group in ("crates", "cubes", "pickups"):
+            for item in obs[group]:
+                i = item["id"]
+                self.items[i] = (group, item, t)
+                seen.add(i)
+        for e in obs["events"]:
+            if e["type"] == "damaged" and e.get("weapon") != "zone":
                 self.last_damage = t
                 if e.get("bearing") is not None:
-                    yaw = float(e["bearing"])
-                    self.damage_source = (pos[0] + 65.0 * math.cos(yaw), pos[1] + 65.0 * math.sin(yaw), pos[2])
-        for m in obs.get("mechs", []):
-            if m.get("kind") == "mech":
-                self.recent_enemies[m["id"]] = (tuple(m["pos"]), t, m.get("cubes", 0))
-                self.last_seen_enemy = t
-        # Expire old enemy sightings (> 12 s)
-        for mid in [k for k, v in self.recent_enemies.items() if t - v[1] > 12.0]:
-            del self.recent_enemies[mid]
-        for s in obs.get("sounds", []):
-            kind = s.get("kind", "")
-            if kind in ("step", "boost", "jet", "gun", "laser", "laser_charge", "lightning", "mortar"):
-                dist = s.get("dist", "far")
-                w = 3.0 if dist == "near" else 1.5 if dist == "mid" else 0.5
-                if s.get("bearing") is not None:
-                    self.danger_sounds.append((t, float(s["bearing"]), w))
-        self.danger_sounds = [d for d in self.danger_sounds if t - d[0] < 10.0][-16:]
+                    yaw = e["bearing"]
+                    self.damage_source = {"pos": (pos[0] + 70 * math.cos(yaw), pos[1] + 70 * math.sin(yaw), pos[2])}
+            if e["type"] == "took" or (e["type"] == "take_failed" and e.get("reason") in ("gone", "have")):
+                self.items.pop(e["id"], None)
+        for i, (group, item, last) in list(self.items.items()):
+            if i in seen:
+                continue
+            p = item["pos"]
+            if t - last > (80 if group == "pickups" else 25) or (distance(p, pos) < 7 and abs(p[2]-pos[2]) < 4):
+                del self.items[i]
+        own_hits = {e["target"] for e in obs["events"] if e["type"] == "hit"}
+        for enemy in obs["mechs"]:
+            if enemy["kind"] != "mech" or "hp" not in enemy:
+                continue
+            i = enemy["id"]
+            previous, last = self.enemy_hp.get(i, (enemy["hp"], -99))
+            if (i not in own_hits and t-last < 0.3 and previous-enemy["hp"] >= 12
+                    and distance(enemy["pos"], obs["zone"]["center"]) < obs["zone"]["radius"]):
+                self.enemy_hurt[i] = t
+            self.enemy_hp[i] = enemy["hp"], t
+        self.visits[(round(pos[0] / 28), round(pos[1] / 28))] = t
 
-    def _upgrade(self, obs):
-        offer = obs.get("offer")
-        if not offer:
-            return None
-        choices = offer.get("choices") or []
+    def gear_value(self, kind, obs):
+        # The arm gun complements every secondary and consumes no energy.
+        if kind == "laser":
+            return 4.3
+        if kind == "lightning":
+            return 4.7 if obs["zone"]["radius"] < 60 else 3.65
+        return {"mortar": 2.85, "gun": 3.1}.get(kind, 0)
+
+    def equipment(self, obs):
+        me = obs["self"]
+        held = [w["kind"] if w else None for w in me["weapons"]]
+        take = {}
+        best = 0
+        for p in obs["pickups"]:
+            if p["kind"] in held or distance(p["pos"], me["pos"]) >= self.cfg["loot"]["pickup_radius"]:
+                continue
+            if abs(p["pos"][2] - me["pos"][2]) >= 4:
+                continue
+            if None in held:
+                slot = held.index(None)
+                gain = self.gear_value(p["kind"], obs)
+            else:
+                # Retain the reliable arm gun even late in the ring.
+                slot = next((i for i, w in enumerate(held) if w != "gun"), 1)
+                gain = self.gear_value(p["kind"], obs) - self.gear_value(held[slot], obs)
+                if me["weapons"][slot].get("charge", 0) > 0:
+                    continue
+            if gain > best + 0.02:
+                best = gain
+                take = {"take": p["id"]}
+                if held[slot]:
+                    take["drop"] = slot
+        return take
+
+    def upgrade(self, obs):
+        me = obs["self"]
+        values = {"gun_mag": 9.4, "plating": 9.25, "gun_damage": 8.35, "armor": 8.5,
+                  "servos": 7.9, "nanites": 8.7, "laser_damage": 8.6,
+                  "lightning_range": 8.5, "gun_rate": 7.25, "gun_velocity": 7.1,
+                  "laser_charge": 6.7, "mortar_reload": 7.55, "mortar_velocity": 7.65,
+                  "lightning_efficiency": 7.65, "mortar_splash": 7.2, "jets": 6.0,
+                  "reactor": 5.9, "capacitor": 5.5, "sensors": 6.4, "gyros": 5.8,
+                  "laser_pierce": 4.2, "lightning_chain": 4.5}
+        if "gun_mag" in me["upgrades"]:
+            values["gun_mag"] -= 1.55
+        if obs["zone"]["radius"] < 75:
+            values["plating"] += 1.35
+            values["nanites"] -= 1.5
+            values["lightning_efficiency"] += 1.0
+        if "nanites" in me["upgrades"]:
+            values["nanites"] -= 0.8
+        choices = obs["offer"].get("choices") or []
         if not choices:
             return None
-        # Pure survival priority: max HP, damage reduction, regen, speed, jet/boost efficiency, sensors
-        values = {
-            "plating": 12.0,
-            "armor": 10.8,
-            "nanites": 10.2,
-            "servos": 9.5,
-            "jets": 8.6,
-            "reactor": 8.0,
-            "sensors": 7.8,
-            "capacitor": 7.4,
-            "gyros": 6.5,
-            "lightning_range": 5.0,
-            "lightning_efficiency": 4.8,
-            "laser_charge": 4.5,
-            "laser_damage": 4.4,
-            "gun_mag": 4.2,
-            "gun_damage": 4.1,
-            "gun_rate": 4.0,
-            "gun_velocity": 3.9,
-        }
-        return max(range(len(choices)), key=lambda idx: values.get(choices[idx].get("id", ""), 3.0))
+        return max(enumerate(choices), key=lambda it: values.get(it[1]["id"], 4))[0]
 
-    def _silent_pickup(self, obs):
-        """Only pick up a non-mortar weapon if literally within pickup_radius and a slot is empty."""
+    def threat_list(self, obs):
         me = obs["self"]
-        weapons = me.get("weapons", [])
-        held = [w["kind"] if w else None for w in weapons]
-        if None not in held:
-            return {}
-        reach = float(self.cfg.get("loot", {}).get("pickup_radius", 4.0))
         pos = me["pos"]
-        for p in obs.get("pickups", []):
-            kind = p.get("kind")
-            # Never pick up mortar (takes +60% cook-off damage from enemy lasers!)
-            if kind not in ("laser", "lightning") or kind in held:
+        eye = (*pos[:2], pos[2] + me["stats"]["eye_height"])
+        ranked = sorted((m for m in obs["mechs"] if m["kind"] == "mech"), key=lambda m: distance(m["pos"], pos))
+        threats = []
+        for m in ranked[:5]:
+            p = m["pos"]
+            height = self.cfg["mech"]["height"] * (1 + self.cfg["cubes"]["size_per_cube"] * m.get("cubes", 0))
+            if self.arena.clear(eye, (*p[:2], p[2] + 0.72 * height)):
+                threats.append(m)
+        return threats, ranked
+
+    def loot(self, obs, enemies):
+        me, t, zone = obs["self"], obs["t"], obs["zone"]
+        pos = me["pos"]
+        armed = [w["kind"] for w in me["weapons"] if w]
+        secondary = next((k for k in armed if k != "gun"), None)
+        fraction = me["hp"] / me["max_hp"]
+        candidate, highest = None, 0
+        objects = list(self.items.values())
+        objects.extend(("npc", m, t) for m in obs["mechs"] if m["kind"] == "npc")
+        objects.extend(("drop", m, t) for m in obs.get("drops", []))
+        for group, item, last in objects:
+            p, i = item["pos"], item["id"]
+            if self.skip_until.get(i, 0) > t:
                 continue
-            pp = p["pos"]
-            if distance(pp, pos) < reach - 0.15 and abs(pp[2] - pos[2]) < 3.8:
-                return {"take": p["id"]}
-        return {}
+            d = distance(pos, p)
+            climb = max(0, p[2] - self.arena.ground(*p[:2]) - 3.7)
+            uphill = max(0, p[2] - pos[2] - 3)
+            if climb and uphill > min(43, me["max_energy"] * 0.41):
+                continue
+            if d > (215 if group == "drop" else 153):
+                continue
+            travel = d / max(1, me["stats"]["walk_speed"] * 0.97) + (uphill / 6.5 if climb else 0)
+            center, radius = future_ring(zone, t, travel + 5)
+            over = max(0, distance(p, center) - radius + 2)
+            if over > 3.0:
+                continue
+            owner = None
+            if group == "pickups":
+                if item["kind"] in armed:
+                    continue
+                gain = self.gear_value(item["kind"], obs) - (self.gear_value(secondary, obs) if secondary else 0)
+                if gain <= 0.1:
+                    continue
+                worth = (4 + gain * 3.6) if not secondary else (2 + gain * 2.4)
+            elif group == "drop":
+                owner = item.get("holder")
+                if owner is not None and owner != me["id"] and item["progress"] + travel > item["capture_s"] + 1:
+                    continue
+                wait = max(0, item["lands_in"] - travel)
+                if wait > 9:
+                    continue
+                worth = 16 + (1 - fraction) * 32
+                if me["cubes"] >= self.cfg["cubes"]["stat_cap"] and fraction > 0.9:
+                    worth *= 0.52
+                travel += wait + max(0, item["capture_s"] - (item["progress"] if owner == me["id"] else 0))
+            else:
+                worth = {"crates": 6.8, "cubes": 8.4, "npc": 10.8}[group]
+                if me["cubes"] == 0:
+                    worth *= 1.28
+                if group == "crates" and not secondary:
+                    worth += 3
+                if group != "cubes":
+                    travel += 1 + item.get("hp", 300) / (230 if secondary else 150)
+                if me["cubes"] >= self.cfg["cubes"]["stat_cap"]:
+                    worth *= 0.30 if group != "cubes" else 0.48
+            score = worth / (2.25 + travel + over)
+            if self.item_goal == i:
+                score *= 1.25
+            score *= max(0.5, 1 - (t - last) * 0.022)
+            if enemies:
+                if any(distance(e["pos"], p) < 30 for e in enemies):
+                    score *= 0.25 if group == "drop" else 0.48
+                if group in ("npc", "crates") or d > 28:
+                    score *= 0.57
+            if group == "drop" and owner == me["id"]:
+                score += 8
+            if score > highest:
+                candidate, highest = (group, item), score
+        return candidate, highest
 
-    def _fallback_act(self, obs):
-        me = obs["self"]
+    def remember_goal(self, candidate, obs):
+        if candidate is None:
+            self.item_goal = self.item_check = None
+            return
+        item = candidate[1]
+        t, pos = obs["t"], obs["self"]["pos"]
+        d = math.dist(item["pos"], pos)
+        if self.item_goal == item["id"] and self.item_check:
+            start, best = self.item_check
+            if d < best - 5:
+                self.item_check = (t, d)
+            elif t - start > (11 if candidate[0] == "drop" else 6) and d > 6:
+                self.skip_until[item["id"]] = t + 20
+                self.item_check = None
+        else:
+            self.item_check = (t, d)
+        self.item_goal = item["id"]
+
+    def explore(self, obs):
+        t, me, zone = obs["t"], obs["self"], obs["zone"]
         pos = me["pos"]
-        goal = obs["zone"]["next_center"]
-        ux, uy = unit(goal[0] - pos[0], goal[1] - pos[1])
-        act = {
-            "tick": obs["tick"],
-            "move": [ux, uy],
-            "boost": not me.get("in_zone", True),
-            "jump": False,
-            "aim": list(me.get("aim", [0.0, 0.0])),
-            "fire": [False, False],
-            "reload": False,
-        }
-        pick = self._upgrade(obs)
-        if pick is not None:
-            act["pick"] = pick
-        return act
+        center, radius = future_ring(zone, t, 20)
+        if self.waypoint and self.waypoint_until > t and distance(pos, self.waypoint) > 6 and distance(self.waypoint, center) <= radius:
+            return self.waypoint
+        best = None
+        value = -math.inf
+        for _ in range(23):
+            a = self.rng.uniform(-math.pi, math.pi)
+            d = self.rng.uniform(min(27, radius * 0.35), min(88, max(12, radius)))
+            p = inside_goal((pos[0]+d*math.cos(a), pos[1]+d*math.sin(a)), center, radius * 0.90)
+            if not self.arena.walkable(*p):
+                continue
+            recent = self.visits.get((round(p[0]/28), round(p[1]/28)), -100)
+            score = min(1.1, (t-recent)/36) + self.rng.random() * 0.3
+            clearance = self.arena.ground_clearance(*p)
+            score += 0.85 * max(0, 1 - abs(clearance - 12) / 36)
+            score -= abs(distance(p, center) - 0.61 * min(radius, zone["next_radius"])) / max(70, radius)
+            if score > value:
+                best, value = p, score
+        self.waypoint = best or center
+        self.waypoint_until = t + 9
+        return self.waypoint
 
-    def _plan(self, obs):
+    def protect(self, pos, enemies, zone, t):
+        center, radius = future_ring(zone, t, 8)
+        if t >= self.shelter_until or (self.shelter is not None and distance(self.shelter, center) > radius):
+            self.shelter = self.arena.cover(pos, enemies, center, max(1, radius - min(4, radius*0.1)), retreat=True)
+            self.shelter_until = t + 1.25
+        return self.shelter
+
+    def plan(self, obs, threats, known):
         me, zone, t = obs["self"], obs["zone"], obs["t"]
         pos = me["pos"]
-        arena = self.arena
-        visible_mechs = [m for m in obs.get("mechs", []) if m.get("kind") == "mech"]
-        npcs = [m for m in obs.get("mechs", []) if m.get("kind") == "npc"]
-
-        # Check direct LOS threats
-        eye = (pos[0], pos[1], pos[2] + me["stats"]["eye_height"])
-        los_threats = []
-        for m in visible_mechs:
-            mp = m["pos"]
-            h = self.cfg["mech"]["height"] * (1.0 + self.cfg["cubes"]["size_per_cube"] * m.get("cubes", 0))
-            if arena.clear(eye, (mp[0], mp[1], mp[2] + 0.72 * h)):
-                los_threats.append(m)
-
-        # Zone timing & safety
-        center14, radius14 = future_ring(zone, t, 14.0)
-        next_center, next_radius = zone["next_center"], zone["next_radius"]
-        safe_next = max(0.0, next_radius - min(16.0, 0.18 * next_radius))
-        to_next = distance(pos, next_center)
+        hp = me["hp"] / me["max_hp"]
+        self.recovering = (hp < 0.60 or (self.recovering and hp < 0.91)) and me["in_zone"]
+        if self.recovering and zone["radius"] < 20:
+            self.recovering = False
+        center, radius = future_ring(zone, t, 15)
+        to_next = distance(pos, zone["next_center"])
+        safe_next = max(0, zone["next_radius"] - min(15, 0.22 * zone["next_radius"]))
         remaining = max(0.0, to_next - safe_next)
-        if remaining > 16.0:
+        if remaining > 16:
             key, expires, detour = self.route_budget
-            cur = (next_center[0], next_center[1], next_radius)
-            if key != cur or expires <= t:
-                dest_tmp = inside_goal(pos, next_center, safe_next)
-                tb = arena.travel_bound(pos, dest_tmp)
-                detour = min(130.0, max(0.0, tb - remaining)) if math.isfinite(tb) else 40.0
-                self.route_budget = (cur, t + 2.5, detour)
+            current = (*zone["next_center"], zone["next_radius"])
+            if key != current or expires <= t:
+                dest = inside_goal(pos, zone["next_center"], safe_next)
+                detour = min(125, max(0, self.arena.travel_bound(pos, dest) - remaining))
+                self.route_budget = current, t + 2, detour
             remaining += detour
-
-        walk = max(1.0, float(me["stats"].get("walk_speed", 11.7)))
-        silent_spd = max(1.0, min(walk, float(self.cfg.get("sound", {}).get("step_speed", 5.0)) - 0.5))
-        roof_extra = 0.0
-        if next_radius < 14.0 and not arena.walkable(next_center[0], next_center[1]):
-            rz = arena.roof(next_center[0], next_center[1])
-            if rz > pos[2] + 3.0:
-                roof_extra = 8.0 + (rz - pos[2]) / 6.0
-
-        eta_fast = 6.0 + remaining / (walk * 0.72) + roof_extra
-        eta_silent = 8.0 + remaining / (silent_spd * 0.80) + roof_extra
-
-        # 1. Tiny final circle: exact center positioning
-        if zone["radius"] <= 6.0:
-            return "last", next_center, 0.0, False, False
-
-        # 2. Urgent zone rotation (outside zone, about to be clipped, or won't make shrink_end at fast walk)
-        urgent_rotate = (
-            not me["in_zone"]
-            or distance(pos, center14) > max(0.0, radius14 - min(6.0, 0.12 * radius14))
-            or (to_next > safe_next + 3.0 and t + eta_fast >= zone["shrink_end"])
-        )
-        if urgent_rotate:
-            dest = inside_goal(pos, next_center, safe_next)
-            if distance(dest, pos) < 4.0:
-                dest = inside_goal(pos, center14, max(0.0, radius14 - min(22.0, 0.4 * radius14)))
-            need_boost = (not me["in_zone"]) or (t + eta_fast + 4.0 >= zone["shrink_end"]) or bool(los_threats)
-            return "rotate", dest, 0.0, False, need_boost
-
-        # 3. Emergency escape: spotted, taking fire, enemy nearby, or shaking 5 s memory!
-        under_fire = (t - self.last_damage) < 6.5
-        shaking_memory = (t - self.last_seen_enemy) < 6.5
-        near_sound_threat = any(t - st < 1.2 and w >= 3.0 for st, _, w in self.danger_sounds)
-        enemy_close = any(distance(pos, m["pos"]) < 130.0 for m in visible_mechs)
-        if (los_threats or under_fire or enemy_close or shaking_memory) and zone["radius"] > 14.0:
-            # Build attacker list (visible first, then recent memory, then damage bearing)
-            attackers = list(los_threats) if los_threats else list(visible_mechs)
-            if not attackers:
-                attackers = [ep for ep, et, _ in self.recent_enemies.values() if t - et < 8.0]
-            if not attackers and self.damage_source is not None and under_fire:
-                attackers = [self.damage_source]
-            c8, r8 = future_ring(zone, t, 8.0)
-            safe_r8 = max(2.0, r8 - min(6.0, 0.10 * r8))
-            # While shaking 5 s memory behind cover, keep putting distance & buildings between us and pursuers
-            keep_moving = (not los_threats) and (shaking_memory or under_fire)
-            if (self.shelter is None or t >= self.shelter_until
-                    or distance(self.shelter, c8) > safe_r8
-                    or (los_threats and distance(pos, self.shelter) < 4.5)
-                    or (keep_moving and distance(pos, self.shelter) < 6.0)):
-                self.shelter = arena.escape_cover(pos, attackers, c8, safe_r8, keep_moving=keep_moving)
-                self.shelter_until = t + 1.35
-            if self.shelter is not None:
-                in_danger_now = bool(los_threats) or (t - self.last_damage < 2.2)
-                # Walk normally (no boost noise, letting energy regen) while shaking memory out of LOS
-                return "escape", self.shelter, 1.5, False, in_danger_now
-            if attackers:
-                ax = sum((a["pos"][0] if isinstance(a, dict) else a[0]) for a in attackers) / len(attackers)
-                ay = sum((a["pos"][1] if isinstance(a, dict) else a[1]) for a in attackers) / len(attackers)
-                dx, dy = unit(pos[0] - ax, pos[1] - ay)
-                esc = inside_goal((pos[0] + 45.0 * dx, pos[1] + 45.0 * dy), c8, safe_r8)
-                return "escape", esc, 0.0, False, True
+        eta = 5 + remaining / max(1, me["stats"]["walk_speed"] * 0.67)
+        if (zone["next_radius"] < 10 and not self.arena.walkable(*zone["next_center"])
+                and self.arena.roof(*zone["next_center"]) > pos[2] + 3):
+            eta += 8 + max(0, self.arena.roof(*zone["next_center"]) - pos[2]) / 6
+        rotate = (not me["in_zone"] or distance(pos, center) > max(0, radius - min(5, radius*0.1))
+                  or (to_next > safe_next + 3 and t + eta >= zone["shrink_end"]))
+        # Bank a near-complete repair before moving again. The reward is
+        # immediate, and exiting the capture area resets its progress.
+        for drop in obs.get("drops", []):
+            remaining = drop["capture_s"] - drop["progress"]
+            if (drop.get("holder") == me["id"] and drop["lands_in"] <= 0 and remaining <= 0.8
+                    and distance(pos, drop["pos"]) < drop["radius"]
+                    and me["hp"] > max(0, remaining) * (zone["dps"] if not me["in_zone"] else 0) + 1
+                    and not any(distance(m["pos"], drop["pos"]) < drop["radius"] for m in threats)):
+                return "capture", drop["pos"], None, drop["radius"] * 0.7, False
+        if zone["radius"] <= 5:
+            return "last", zone["next_center"], None, 0, False
+        if rotate:
+            dest = inside_goal(pos, zone["next_center"], safe_next)
+            # A current ring and its following ring can differ greatly. Move
+            # well clear of the current edge even if the next edge is close.
+            if distance(pos, dest) < 4:
+                dest = inside_goal(pos, center, max(0, radius - min(22, radius*0.4)))
+            return "rotate", dest, None, 0, False
+        loot, value = self.loot(obs, threats)
+        closest = distance(pos, threats[0]["pos"]) if threats else math.inf
+        if loot and loot[0] == "drop":
+            drop = loot[1]
+            radius_cap = drop["radius"]
+            capturing = distance(pos, drop["pos"]) < radius_cap and drop["lands_in"] < 1
+            if (capturing or hp < 0.72) and closest > (15 if capturing else 42) and value > 0.65:
+                self.remember_goal(loot, obs)
+                return "capture", drop["pos"], None, radius_cap * 0.47, self.recovering
+        under_fire = t - self.last_damage < 2.8
+        outnumbered = sum(distance(pos, m["pos"]) < 130 for m in threats) >= 2
+        aimed = sum(math.cos(m["aim"][0] - math.atan2(pos[1] - m["pos"][1], pos[0] - m["pos"][0])) > 0.92 for m in threats)
+        # In a free-for-all, two opponents exchanging fire can yield a place
+        # for free. Look for an actual health loss and another mech facing it.
+        trading = False
+        if len(threats) >= 2 and not under_fire and not aimed:
+            for victim in threats:
+                if t - self.enemy_hurt.get(victim["id"], -99) > 1.25 or victim.get("hp", 0) < 300:
+                    continue
+                for shooter in threats:
+                    if shooter["id"] == victim["id"]:
+                        continue
+                    vp, sp = victim["pos"], shooter["pos"]
+                    bearing = math.atan2(vp[1] - sp[1], vp[0] - sp[0])
+                    if math.cos(shooter["aim"][0] - bearing) > 0.97:
+                        trading = True
+                        break
+        hurt_or_focused = bool(threats) or self.recovering or trading or under_fire or (outnumbered and (under_fire or hp < 0.88 or aimed >= 2))
+        attackers = threats or known or ([self.damage_source] if under_fire and self.damage_source else [])
+        if attackers and hurt_or_focused and zone["radius"] > 16:
+            escape = self.protect(pos, attackers, zone, t)
+            if escape is not None:
+                return "retreat", escape, None, 1.0, trading or (self.recovering and not threats)
+            dx, dy = unit(pos[0] - attackers[0]["pos"][0], pos[1] - attackers[0]["pos"][1])
+            escape = inside_goal((pos[0]+35*dx, pos[1]+35*dy), center, radius*0.92)
+            return "retreat", escape, None, 0, trading
         else:
             self.shelter = None
-            self.shelter_until = -1.0
-
-        # 4. Silent opportunistic ground cube grab (zero risk, zero noise)
-        if not visible_mechs and not under_fire and not near_sound_threat and (t - self.last_seen_enemy > 9.0):
-            best_cube = None
-            best_d = 20.0
-            for c in obs.get("cubes", []):
-                cp = c["pos"]
-                d = distance(pos, cp)
-                if d < best_d and abs(cp[2] - pos[2]) < 3.0 and distance(cp, center14) < max(2.0, radius14 - 8.0):
-                    if not any(distance(cp, npc["pos"]) < 48.0 for npc in npcs):
-                        best_cube, best_d = cp, d
-            if best_cube is not None:
-                return "cube", best_cube[:2], 0.5, True, False
-
-        # 5. Proactive silent hold at a high-occlusion hide spot inside next_zone
-        zone_key = (round(next_center[0], 1), round(next_center[1], 1), round(next_radius, 1))
-        npc_too_close = any(distance(pos, npc["pos"]) < 48.0 for npc in npcs)
-        hide_invalid = (
-            self.hide_goal is None
-            or self.hide_zone_key != zone_key
-            or t >= self.hide_until
-            or distance(self.hide_goal, next_center) > max(2.0, next_radius - min(8.0, 0.12 * next_radius))
-            or npc_too_close
-            or (near_sound_threat and distance(pos, self.hide_goal) < 8.0)
-        )
-        if hide_invalid:
-            d_dirs = [(b, w) for _, b, w in self.danger_sounds]
-            self.hide_goal = arena.hide_spot(pos, next_center, max(4.0, next_radius), d_dirs, npcs, self.rng)
-            if self.hide_goal is None:
-                self.hide_goal = inside_goal(pos, next_center, safe_next)
-            self.hide_zone_key = zone_key
-            self.hide_until = t + 28.0
-
-        # Walk silently to hide spot if we have time; otherwise walk normally (no boost)
-        use_silent = (to_next <= safe_next + 5.0) or (t + eta_silent < zone["shrink_end"])
-        return "hide", self.hide_goal, 2.0, use_silent, False
+            self.shelter_until = -1
+        # Once equipped, expose ourselves for a useful pickup or a rotation.
+        # In a shrinking, quiet circle a sheltered edge costs less health.
+        equipped = all(me["weapons"]) and me["cubes"] >= 6
+        hold_ground = (not threats and 18 < radius < 150 and equipped and value < 0.95)
+        if hold_ground:
+            if self.hold is None or self.hold_until < t or distance(self.hold, center) > radius - 4:
+                self.hold = self.arena.cover(pos, [], center, radius-4)
+                self.hold_until = t + 7
+            if self.hold is not None:
+                return "hold", self.hold, None, 1.25, True
+        if loot:
+            group, obj = loot
+            easy = distance(pos, obj["pos"]) <= (16 if group == "cubes" else 21)
+            if not threats or (group in ("pickups","cubes","drop") and easy and closest > 16 and value > 0.8):
+                self.remember_goal(loot, obs)
+                if self.recovering and group in ("crates", "npc"):
+                    return "heal", pos, None, 1.5, True
+                if group in ("crates", "npc") and abs(obj["pos"][2] - pos[2]) < 4:
+                    # The pitch limit leaves a blind spot at the mech's feet.
+                    dx, dy = unit(pos[0] - obj["pos"][0], pos[1] - obj["pos"][1])
+                    gap = max(12, me["stats"]["muzzle_height"] * 1.7) + (8 if group == "npc" else 0)
+                    if dx == dy == 0:
+                        dx = 1
+                    vantage = (obj["pos"][0] + gap*dx, obj["pos"][1] + gap*dy)
+                    if self.arena.walkable(*vantage) and distance(vantage, center) < radius:
+                        return "harvest", vantage, obj, 1.0, False
+                return ("capture" if group == "drop" else "loot", obj["pos"],
+                        obj if group in ("crates", "npc") else None,
+                        obj.get("radius", 6) * 0.48 if group == "drop" else 0, self.recovering)
+        if threats:
+            return "duel", threats[0]["pos"], None, 0, False
+        self.remember_goal(None, obs)
+        if self.recovering:
+            return "heal", pos, None, 1, True
+        if zone["radius"] < 19:
+            return "hold", inside_goal(pos, center, radius * 0.6), None, 0.8, False
+        return "explore", self.explore(obs), None, 0, False
 
     def act(self, obs):
-        if self.arena is None:
-            return self._fallback_act(obs)
-        try:
-            self.arena.set_body(obs["self"]["stats"])
-            self._remember(obs)
-            mode, goal, anchor, silent, urgent_boost = self._plan(obs)
-            self.mode = mode
-            action = self.aim.act(obs, self.arena)
-            pos = obs["self"]["pos"]
-            climbing = False
-            if len(goal) == 2 and mode in ("last", "rotate", "hide") and not self.arena.walkable(goal[0], goal[1]):
+        self.arena.set_body(obs["self"]["stats"])
+        self.remember(obs)
+        threats, known = self.threat_list(obs)
+        mode, goal, focus, anchor, quiet = self.plan(obs, threats, known)
+        self.mode = mode
+        action = self.combat.act(obs, self.arena, focus, quiet)
+        primary = self.combat.target
+        if primary is None or primary.get("kind") != "mech":
+            primary = threats[0] if threats else None
+        elif mode == "duel":
+            goal = primary["pos"]
+        pos = obs["self"]["pos"]
+        climbing = False
+        if mode != "duel":
+            if len(goal) == 2 and mode in ("last", "rotate", "hold") and not self.arena.walkable(*goal):
+                # If any nearby ground is inside the destination ring, take it.
+                # A ring entirely above a building instead requires a jet ascent.
                 zone = obs["zone"]
-                radial = min(zone["next_radius"] * 0.7, 26.0)
+                radial = min(zone["next_radius"]*0.7, 26)
                 ground_goals = []
-                if radial >= 2.0:
+                if radial >= 2:
                     for j in range(12):
-                        theta = j * math.tau / 12.0
-                        p = (goal[0] + radial * math.cos(theta), goal[1] + radial * math.sin(theta))
-                        if distance(p, zone["next_center"]) < zone["next_radius"] and self.arena.walkable(p[0], p[1]):
+                        theta = j * math.tau / 12
+                        p = goal[0] + radial * math.cos(theta), goal[1] + radial * math.sin(theta)
+                        if distance(p, zone["next_center"]) < zone["next_radius"] and self.arena.walkable(*p):
                             ground_goals.append(p)
                 if ground_goals:
                     goal = min(ground_goals, key=lambda p: distance(pos, p))
                 else:
-                    goal = (goal[0], goal[1], self.arena.roof(goal[0], goal[1]))
+                    goal = (*goal, self.arena.roof(*goal))
             if len(goal) == 3:
-                climbing = (goal[2] > self.arena.ground(goal[0], goal[1]) + 3.8
-                            and (goal[2] > pos[2] + 0.4
-                                 or (not obs["self"]["grounded"] and pos[2] < goal[2] + 1.5)))
-            action.update(self.feet.move(obs, self.arena, goal, mode, climbing, anchor, silent, urgent_boost))
-            action.update(self._silent_pickup(obs))
-            pick = self._upgrade(obs)
+                climbing = (goal[2] > self.arena.ground(*goal[:2]) + 3.8 and (goal[2] > pos[2] + 0.4 or (not obs["self"]["grounded"] and pos[2] < goal[2] + 1.5)))
+        action.update(self.feet.move(obs, self.arena, goal, mode, primary, climbing, anchor))
+        action.update(self.equipment(obs))
+        if obs.get("offer"):
+            pick = self.upgrade(obs)
             if pick is not None:
                 action["pick"] = pick
-            action["tick"] = obs["tick"]
-            return action
-        except Exception:
-            print(f"act error at tick {obs.get('tick')}:\n{traceback.format_exc()}", file=sys.stderr, flush=True)
-            return self._fallback_act(obs)
+        action["tick"] = obs["tick"]
+        return action
 
 
 if __name__ == "__main__":
