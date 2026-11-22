@@ -68,10 +68,11 @@ class MatchRead:
                             p[2]-1 <= a[2]+f*(end[2]-a[2]) <= p[2]+self.body['height']*size+1):
                         self.rival_hits.add((b['by'], rid))
         other_deaths = self.start_alive - obs['alive'] - len(self.kills)
-        # Late storm eliminations are especially poor team evidence.
-        self.is_ffa = (len(self.rival_hits) >= 2 or
-                       (t < 120 and (other_deaths >= 3 or (other_deaths >= 1 and self.rival_hits))))
-        self.is_ffa = bool(self.is_ffa)
+        # Reliable FFA Finals latch without false-triggering in Practice.
+        self.is_ffa = bool(len(self.rival_hits) >= 2
+                           or (t < 100 and other_deaths >= 2)
+                           or other_deaths >= 4
+                           or (t < 120 and other_deaths >= 1 and self.rival_hits))
 
 
 class Bot:
@@ -159,7 +160,7 @@ class Bot:
         if kind == 'gun':
             return 11.  # Recover the permanent arm if presented with a gunless loadout.
         if kind == 'laser':
-            return 8.
+            return 9.5
         if kind == 'lightning':
             return 9. if obs['zone']['radius'] < 38 else 6.3
         if kind == 'mortar':
@@ -268,7 +269,7 @@ class Bot:
     def rotation(self, obs):
         me, z, t = obs['self'], obs['zone'], obs['t']
         p, c, r = me['pos'], z['next_center'], z['next_radius']
-        center, future = ring_at(z,t,5.)
+        center, future = ring_at(z, t, 12.)
         need = distance(p,c) - max(0., r-min(12., r*.25))
         if me['in_zone'] and need < max(.25, r*.025) and z['radius'] > 6:
             return None
@@ -279,8 +280,8 @@ class Bot:
             goal = self.ground_goal(p,c,r)
             self.route_extra = min(140., max(0., self.arena.travel_bound(p,goal)-distance(p,goal)))
             self.route_climb = max(0.,goal[2]-p[2]-2.) if not self.arena.walkable(*goal[:2]) else 0.
-        eta = (max(0., need) + self.route_extra) / max(1., me['stats']['walk_speed']*.83) + self.route_climb/6.5 + 4.
-        if (not me['in_zone'] or z['radius'] < 6 or distance(p,center) > max(0., future-min(4., future*.12))
+        eta = (max(0., need) + self.route_extra) / max(1., me['stats']['walk_speed']*.68) + self.route_climb/6.5 + 5.
+        if (not me['in_zone'] or z['radius'] < 6 or distance(p,center) > max(0., future-min(5., future*.12))
                 or (need > 1. and t+eta >= z['shrink_end'])):
             return Plan('rotate', self.ground_goal(p, c, r))
         return None
@@ -439,9 +440,12 @@ class Bot:
         if resource:
             value, group, obj = resource
             d = distance(p,obj['pos'])
-            if group == 'drop' and (obj.get('holder') == me['id'] or
-                    (value > 1.7 and (not visible or fraction < .78 or d < obj['radius']+5.))):
-                return self.follow(resource,obs)
+            if group == 'drop':
+                rem_cap = obj['capture_s'] - (obj['progress'] if obj.get('holder') == me['id'] else 0.)
+                drop_ambush = (len(visible) >= 2 and min(distance(p, e['pos']) for e in visible) < 65. and rem_cap > 1.2)
+                if not drop_ambush and (obj.get('holder') == me['id'] or
+                        (value > 1.7 and (not visible or fraction < .78 or d < obj['radius']+5.))):
+                    return self.follow(resource,obs)
             # A second arm on our route pays for itself in a single duel.
             # Avoid crossing a rival or delaying a finish to obtain it.
             if visible and group in ('pickups','cubes'):
@@ -490,7 +494,7 @@ class Bot:
         if resource:
             value, group, obj = resource
             if (not finals and value > (.80 if me['cubes']>=10 and all(me['weapons']) else .31)) or (
-                    finals and value > (1.35 if me['cubes']>=3 and all(me['weapons']) else .7)):
+                    finals and value > (.95 if me['cubes']>=6 and all(me['weapons']) else .45)):
                 return self.follow(resource,obs)
         if finals:
             safe = self.cover_goal(obs,contacts,center,radius)
