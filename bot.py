@@ -41,8 +41,6 @@ class Bot:
         self.last_duel = None
         self.finish_spot = None
         self.finish_until = -1
-        self.peek_spot_cache = None
-        self.peek_until = -1
 
     def remember(self, obs):
         t, me = obs["t"], obs["self"]
@@ -83,16 +81,16 @@ class Bot:
             self.enemy_hp[i] = enemy["hp"], t
         if not self.is_ffa:
             others_dead = (self.start_alive - obs.get("alive", self.start_alive)) - self.my_kills
-            if (others_dead >= 2 and t < 100) or len(self.enemy_hurt) >= 2:
+            if (others_dead >= 2 and t < 100) or others_dead >= 4:
                 self.is_ffa = True
         self.visits[(round(pos[0] / 28), round(pos[1] / 28))] = t
 
     def gear_value(self, kind, obs):
         # The arm gun complements every secondary and consumes no energy.
         if kind == "laser":
-            return 4.3
+            return 5.2
         if kind == "lightning":
-            return 4.7 if obs["zone"]["radius"] < 60 else 3.65
+            return 5.5 if obs["zone"]["radius"] < 65 else 3.2
         return {"mortar": 2.85, "gun": 3.1}.get(kind, 0)
 
     def equipment(self, obs, threats=()):
@@ -129,25 +127,21 @@ class Bot:
 
     def upgrade(self, obs):
         me = obs["self"]
-        values = {"nanites": 9.8, "sensors": 9.5, "laser_damage": 9.35, "plating": 9.3,
-                  "gun_mag": 9.2, "laser_charge": 9.15, "armor": 9.1,
-                  "lightning_range": 8.9, "gun_damage": 8.6, "lightning_efficiency": 8.5,
-                  "gun_velocity": 8.4, "servos": 8.2, "gun_rate": 7.7,
-                  "mortar_velocity": 7.65, "mortar_reload": 7.55, "mortar_splash": 7.2,
-                  "jets": 6.0, "reactor": 5.9, "gyros": 5.8, "capacitor": 5.5,
-                  "lightning_chain": 4.8, "laser_pierce": 4.2}
+        values = {"gun_mag": 9.4, "plating": 9.25, "gun_damage": 8.35, "armor": 8.5,
+                  "servos": 7.9, "nanites": 8.7, "laser_damage": 8.6,
+                  "lightning_range": 8.5, "gun_rate": 7.25, "gun_velocity": 7.1,
+                  "laser_charge": 6.7, "mortar_reload": 7.55, "mortar_velocity": 7.65,
+                  "lightning_efficiency": 7.65, "mortar_splash": 7.2, "jets": 6.0,
+                  "reactor": 5.9, "capacitor": 5.5, "sensors": 6.4, "gyros": 5.8,
+                  "laser_pierce": 4.2, "lightning_chain": 4.5}
         if "gun_mag" in me["upgrades"]:
             values["gun_mag"] -= 1.55
-        if "nanites" in me["upgrades"]:
-            values["nanites"] -= 0.6
-        if "sensors" in me["upgrades"]:
-            values["sensors"] -= 0.8
-        if obs["zone"]["radius"] < 120:
-            values["sensors"] -= 2.5
         if obs["zone"]["radius"] < 75:
             values["plating"] += 1.35
-            values["nanites"] -= 1.8
+            values["nanites"] -= 1.5
             values["lightning_efficiency"] += 1.0
+        if "nanites" in me["upgrades"]:
+            values["nanites"] -= 0.8
         return max(enumerate(obs["offer"]["choices"]), key=lambda it: values.get(it[1]["id"], 4))[0]
 
     def threat_list(self, obs):
@@ -183,7 +177,7 @@ class Bot:
             uphill = max(0, p[2] - pos[2] - 3)
             if climb and uphill > min(43, me["max_energy"] * 0.41):
                 continue
-            if d > (215 if group == "drop" else 153):
+            if d > (220 if (group == "drop" or (group == "pickups" and item["kind"] == "laser" and secondary != "laser" and zone["radius"] >= 65)) else 153):
                 continue
             travel = d / max(1, me["stats"]["walk_speed"] * 0.97) + (uphill / 6.5 if climb else 0)
             center, radius = future_ring(zone, t, travel + 5)
@@ -199,9 +193,10 @@ class Bot:
                 gain = self.gear_value(item["kind"], obs) - (self.gear_value(secondary, obs) if secondary else 0)
                 if gain <= 0.1:
                     continue
-                worth = (4 + gain * 3.6) if not secondary else (2 + gain * 2.4)
-                if item["kind"] == "laser" and not secondary:
-                    worth *= 1.35
+                if item["kind"] == "laser" and secondary != "laser" and zone["radius"] >= 65:
+                    worth = 28.0 if not secondary else 20.0
+                else:
+                    worth = (4 + gain * 3.6) if not secondary else (2 + gain * 2.4)
             elif group == "drop":
                 owner = item.get("holder")
                 if owner is not None and owner != me["id"] and item["progress"] + travel > item["capture_s"] + 1:
@@ -292,7 +287,8 @@ class Bot:
         me, zone, t = obs["self"], obs["zone"], obs["t"]
         pos = me["pos"]
         hp = me["hp"] / me["max_hp"]
-        self.recovering = (hp < 0.60 or (self.recovering and hp < 0.91)) and me["in_zone"]
+        low, high = (0.60, 0.91) if self.is_ffa else (0.48, 0.86)
+        self.recovering = (hp < low or (self.recovering and hp < high)) and me["in_zone"]
         if self.recovering and zone["radius"] < 20:
             self.recovering = False
         center, radius = future_ring(zone, t, 15)
@@ -359,8 +355,15 @@ class Bot:
                         trading = True
                         break
         hurt_or_focused = self.recovering or trading or (outnumbered and (under_fire or hp < 0.88 or aimed >= 2))
+        has_laser = any(w and w["kind"] == "laser" for w in me["weapons"])
+        has_light = any(w and w["kind"] == "lightning" for w in me["weapons"])
+        naked_vs_laser = (not has_laser and zone["radius"] > 80 and threats
+                          and not (has_light and closest <= 52.0)
+                          and any("laser" in m.get("weapons", ()) and m.get("hp", 1400) > 450 for m in threats))
+        if naked_vs_laser:
+            hurt_or_focused = True
         if (not self.is_ffa and len(threats) == 1 and not outnumbered and not trading
-                and me["hp"] > 450 and threats[0].get("hp", 9999) <= 340 and closest < 175):
+                and me["hp"] > 400 and threats[0].get("hp", 9999) <= 480 and closest < 175):
             hurt_or_focused = False
         attackers = threats or known or ([self.damage_source] if under_fire and self.damage_source else [])
         if attackers and hurt_or_focused and zone["radius"] > 16:
@@ -375,7 +378,7 @@ class Bot:
             self.shelter = None
             self.shelter_until = -1
         # Opus #4: 5-second kill window when a wounded duel target slips behind cover.
-        if not threats and not self.recovering and zone["radius"] > 22 and self.last_duel is not None:
+        if not self.is_ffa and not threats and not self.recovering and zone["radius"] > 22 and self.last_duel is not None:
             duel_id, duel_t, duel_hp = self.last_duel
             wounded = next((m for m in known if m["id"] == duel_id), None)
             if wounded is None or t - duel_t > 5.0:
@@ -398,25 +401,7 @@ class Bot:
                         self.finish_spot = self.arena.peek_spot(pos, wounded, center, max(1.0, radius - 4))
                         self.finish_until = t + 0.5
                     if self.finish_spot is not None:
-                        return "finish", self.finish_spot, wounded, 0, False
-        # Active Corner-Peek: after ducking behind cover, re-peek with pre-charged laser when ready!
-        if not threats and not self.recovering and zone["radius"] > 22 and known and not self.is_ffa:
-            w_by_k = {w["kind"]: w for w in me["weapons"] if w}
-            lw = w_by_k.get("laser")
-            gw = w_by_k.get("gun")
-            ready_peek = ((lw is not None and lw.get("cooldown", 0.0) <= 0.45)
-                          or (lw is None and gw is not None and gw.get("reload", 0.0) == 0 and gw.get("ammo", 0) >= 6))
-            if ready_peek:
-                target_k = known[0]
-                kd = distance(pos, target_k["pos"])
-                vis_r = 200.0 + me["stats"].get("vision_bonus", 0.0)
-                if 20.0 <= kd <= vis_r + 10.0 and (len(known) == 1 or hp > 0.72):
-                    if (self.peek_spot_cache is None or t >= self.peek_until
-                            or distance(self.peek_spot_cache, center) > max(1.0, radius - 4)):
-                        self.peek_spot_cache = self.arena.peek_spot(pos, target_k, center, max(1.0, radius - 4))
-                        self.peek_until = t + 0.4
-                    if self.peek_spot_cache is not None and distance(pos, self.peek_spot_cache) <= 16.0:
-                        return "peek", self.peek_spot_cache, target_k, 0, False
+                        return "finish", self.finish_spot, None, 0, False
         # Once equipped, expose ourselves for a useful pickup or a rotation.
         # In a shrinking, quiet circle a sheltered edge costs less health (FFA only).
         equipped = all(me["weapons"]) and me["cubes"] >= 6
@@ -429,10 +414,9 @@ class Bot:
                 return "hold", self.hold, None, 1.25, True
         if loot:
             group, obj = loot
-            has_sec = any(w and w["kind"] != "gun" for w in me["weapons"])
-            need_weapon = (group == "pickups" and not has_sec and obj.get("kind") in ("laser", "lightning"))
-            easy = distance(pos, obj["pos"]) <= (45 if need_weapon else (16 if group == "cubes" else 21))
-            if not threats or (group in ("pickups","cubes","drop") and easy and closest > (25 if need_weapon else 16) and value > (0.4 if need_weapon else 0.8)):
+            need_laser = (group == "pickups" and not has_laser and obj.get("kind") == "laser" and zone["radius"] >= 65)
+            easy = distance(pos, obj["pos"]) <= (60 if need_laser else (16 if group == "cubes" else 21))
+            if not threats or (group in ("pickups","cubes","drop") and easy and closest > (22 if need_laser else 16) and value > (0.35 if need_laser else 0.8)):
                 self.remember_goal(loot, obs)
                 if self.recovering and group in ("crates", "npc"):
                     return "heal", pos, None, 1.5, True
@@ -464,7 +448,7 @@ class Bot:
                                     ) > 0.90 for m in threats))
             laser_peek_duck = (not in_light and lw is not None and lw.get("charge", 0.0) <= 0.0
                                and lw.get("cooldown", 0.0) > 0.65 and zone["radius"] > 22
-                               and (len(threats) >= 2 or closest > 135.0 or hp < 0.72)
+                               and (len(threats) >= 2 or (self.is_ffa and (closest > 135.0 or hp < 0.72)))
                                and not any(m.get("hp", 1400) <= 350 for m in threats))
             if dead_window or enemy_charging_at_me or laser_peek_duck:
                 duck = self.protect(pos, threats, zone, t)
@@ -500,10 +484,7 @@ class Bot:
         threats, known = self.threat_list(obs)
         mode, goal, focus, anchor, quiet = self.plan(obs, threats, known)
         self.mode = mode
-        pos = obs["self"]["pos"]
-        prepeek = (mode in ("peek", "finish") and focus is not None
-                   and focus.get("kind") == "mech" and distance(pos, goal) <= 7.0)
-        action = self.combat.act(obs, self.arena, focus, quiet, prepeek=prepeek)
+        action = self.combat.act(obs, self.arena, focus, quiet)
         primary = self.combat.target
         if primary is None or primary.get("kind") != "mech":
             primary = threats[0] if threats else None

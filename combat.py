@@ -24,6 +24,8 @@ class Combat:
         self.blocked_since = {}
         self.arc = {}
         self.light_hold = False
+        self.rear_bearing = None
+        self.rear_until = -1.0
 
     def _observe(self, obs):
         t = obs["t"]
@@ -32,15 +34,9 @@ class Combat:
                 self.last_bearing = e["bearing"]
                 self.bearing_until = t + 1.1
                 self.attacks[e.get("by")] = t
-        if self.bearing_until < t:
-            me_id = obs["self"]["id"]
-            pos = obs["self"]["pos"]
-            for b in obs.get("beams", ()):
-                if b.get("by") != me_id and b.get("path"):
-                    src = b["path"][0]
-                    self.last_bearing = math.atan2(src[1] - pos[1], src[0] - pos[0])
-                    self.bearing_until = t + 1.3
-                    break
+                if e.get("rear"):
+                    self.rear_bearing = e["bearing"]
+                    self.rear_until = t + 0.90
         if self.bearing_until < t:
             cues = [s for s in obs["sounds"] if s["kind"] in
                     ("laser_charge", "gun", "laser", "mortar", "boost", "step", "lightning")]
@@ -74,7 +70,7 @@ class Combat:
         self.sight[target["id"]] = now, origin, tuple(pos), chosen
         return chosen
 
-    def _select(self, obs, arena, origin, focus, weapons, quiet, prepeek=False):
+    def _select(self, obs, arena, origin, focus, weapons, quiet):
         me, now = obs["self"], obs["t"]
         last = self.target["id"] if self.target else None
         focus_id = focus.get("id") if focus else None
@@ -120,12 +116,10 @@ class Combat:
         for _, _, obj in candidates[:5]:
             height = self._visible_height(arena, origin, obj, now)
             if height is not None:
-                if obj.get("kind") != "mech" and sheltered is not None and math.dist(sheltered["pos"], me["pos"]) <= 160.0:
-                    break
                 return obj, height, True
             if sheltered is None and obj.get("kind") == "mech":
                 sheltered = obj
-        if sheltered is not None and (now - self.blocked_since[sheltered["id"]] < (2.5 if prepeek and sheltered["id"] == focus_id else 0.65) or
+        if sheltered is not None and (now - self.blocked_since[sheltered["id"]] < 0.65 or
                                       (not quiet and "mortar" in weapons and weapons["mortar"]["cooldown"] < 0.24)):
             return sheltered, self._body(sheltered)[0] * 0.5, False
         return None, 0, False
@@ -224,14 +218,14 @@ class Combat:
         # behind a building. Keep the source in the armored front hemisphere.
         return angle_delta(self.last_bearing + 0.6 * math.sin(now * 1.7), 0)
 
-    def act(self, obs, arena, focus=None, quiet=False, prepeek=False):
+    def act(self, obs, arena, focus=None, quiet=False):
         self._observe(obs)
         me, now = obs["self"], obs["t"]
         sx, sy, sz = me["pos"]
         actual = me["aim"]
         origin = (sx, sy, sz + me["stats"]["muzzle_height"])
         weapons = {w["kind"]: w for w in me["weapons"] if w}
-        obj, height, visible = self._select(obs, arena, origin, focus, weapons, quiet, prepeek=prepeek)
+        obj, height, visible = self._select(obs, arena, origin, focus, weapons, quiet)
         self.target = obj
         trigger = [False, False]
         gun = weapons.get("gun")
@@ -280,8 +274,15 @@ class Combat:
                 command = wishes["mortar"]
             elif gun_in_range and visible and gun["reload"] < 0.15:
                 command = wishes["gun"]
-        if not visible and "mortar" not in wishes and not prepeek and now - self.blocked_since.get(obj["id"], now) >= 0.65:
+        if not visible and "mortar" not in wishes and now - self.blocked_since.get(obj["id"], now) >= 0.65:
             command = (self._scan_yaw(now, actual[0]), 0)
+        # Non-blocking rear-armor face: ONLY when we cannot fire (not visible, OR gun reloading & laser not charging/ready).
+        if self.rear_bearing is not None and now < self.rear_until:
+            gun_dead = (not gun_in_range or gun["reload"] > 0.35 or gun["ammo"] <= 0)
+            laser_busy = bool(laser and laser_in_range and visible and (laser.get("charge", 0) > 0 or laser.get("cooldown", 0) < 0.25))
+            light_busy = bool("lightning" in weapons and visible and distance < weapons["lightning"]["stats"]["range"] + 1)
+            if (not visible and "mortar" not in wishes) or (gun_dead and not laser_busy and not light_busy):
+                command = (self.rear_bearing, 0.0)
         command = (command[0], min(me["stats"]["max_pitch"], max(me["stats"]["min_pitch"], command[1])))
         body_height, radius = self._body(obj)
         for i, w in enumerate(me["weapons"]):
@@ -291,15 +292,11 @@ class Combat:
             aligned = self._aligned(wishes.get(kind), actual, command, me, radius + 0.30, 0.42 * body_height, distance)
             if kind == "gun":
                 trigger[i] = visible and gun_in_range and aligned and w["reload"] == 0 and w["ammo"] > 0
-            elif kind == "laser" and laser_in_range:
-                if visible:
-                    # Releasing is irreversible. Confirm the reported torso has
-                    # actually reached the beam line after switching off gun lead.
-                    on_beam = self._aligned(direct, actual, actual, me, radius, 0.42 * body_height, distance)
-                    trigger[i] = not (laser_release and aligned and on_beam)
-                elif prepeek and is_mech and w.get("charge", 0.0) < stats["charge"] + 0.65:
-                    # Pre-charge laser behind cover while stepping to verified peek spot!
-                    trigger[i] = True
+            elif kind == "laser" and laser_in_range and visible:
+                # Releasing is irreversible. Confirm the reported torso has
+                # actually reached the beam line after switching off gun lead.
+                on_beam = self._aligned(direct, actual, actual, me, radius, 0.42 * body_height, distance)
+                trigger[i] = not (laser_release and aligned and on_beam)
             elif kind == "lightning":
                 cost = stats["energy"]
                 mult = 1 + self.config["cubes"]["damage_per_cube"] * min(me["cubes"], self.config["cubes"]["stat_cap"])
