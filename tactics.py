@@ -127,7 +127,7 @@ class Footwork:
             self.jet_until = t + 0.58
 
         active_jet = t < self.jet_until
-        mobile = mode in ("duel", "retreat", "rotate") or (moving and target_dist > 16)
+        mobile = mode in ("duel", "retreat", "rotate", "duck", "duck_beam") or (moving and target_dist > 16)
         reserve = 24 if mode == "duel" else 13
         if climbing:
             reserve = min(me["max_energy"] * 0.93, max(39, 15 + (altitude - pos[2]) * 2.1))
@@ -135,7 +135,8 @@ class Footwork:
             self.boosting = False
         if me["energy"] > reserve + 28:
             self.boosting = True
-        boost = active_jet or (ground and mobile and self.boosting and moving)
+        urgent_beam = (mode == "duck_beam" and not climbing and me["energy"] > 8)
+        boost = active_jet or (ground and mobile and (self.boosting or urgent_beam) and moving)
         # A leap changes vertical velocity in time for slower, distant rounds.
         jump = active_jet and ground
         if ground and not anchor_radius and not climbing and any(b[0] > 0.33 for b in bullets):
@@ -179,10 +180,6 @@ class Footwork:
             choices.append((math.cos(yaw + angle), math.sin(yaw + angle)))
         best, best_value = desired, -math.inf
         vx, vy = me["vel"][:2]
-        has_light = any(w and w["kind"] == "lightning" for w in me["weapons"])
-        light_foes = ([] if has_light else
-                      [m["pos"] for m in obs["mechs"] if m.get("kind") == "mech"
-                       and "lightning" in m.get("weapons", ()) and distance(pos, m["pos"]) < 72.0])
         for ux, uy in choices:
             value = 2.5 * (desired[0] * ux + desired[1] * uy)
             if not arena.open_step(pos, (ux, uy), 5.2):
@@ -204,10 +201,6 @@ class Footwork:
                     value -= penalty * max(0, 1.3 - d / max(1, size))
             end = pos[0] + ux * speed * 0.55, pos[1] + uy * speed * 0.55
             value -= 1.1 * max(0, distance(end, center) - radius + 1.2 - circle_error)
-            for lpos in light_foes:
-                ld = distance(end, lpos)
-                if ld < 49.0:
-                    value -= 16.0 * (1.0 - ld / 49.0)
             if anchor_radius:
                 value -= 2 * max(0, distance(end, goal) - anchor_radius)
             if value > best_value:

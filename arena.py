@@ -561,3 +561,51 @@ class Arena:
             if score > best_score:
                 best, best_score = (px,py), score
         return best
+
+    def short_cover(self, pos, enemies, center, radius, max_d=14.0):
+        """Fallback close-range cover search <= max_d when cover() picked a farther point."""
+        x, y = pos[:2]
+        start = self._nearest(pos)
+        if start is None or not enemies:
+            return None
+        cid = self.component[start]
+        threats = []
+        for enemy in enemies:
+            ex, ey, ez = enemy["pos"]
+            muzzle = self.muzzle * (1 + self.size_per_cube * enemy.get("cubes", 0))
+            threats.append((ex, ey, ez + muzzle))
+        threats.sort(key=lambda e: math.dist(e[:2], (x, y)))
+        threats = threats[:3]
+        cx, cy = center[:2]
+        candidates = set()
+        for length in (4.5, 8.5, 13.0, 17.0):
+            if length > max_d + 1.0:
+                continue
+            for k in range(12):
+                angle = (k + (int(length) % 3) * 0.2) * math.tau / 12
+                px, py = x + length * math.cos(angle), y + length * math.sin(angle)
+                ix = round((px - self.ox) / self.gap)
+                iy = round((py - self.oy) / self.gap)
+                if 0 <= ix < self.width and 0 <= iy < self.rows:
+                    n = iy * self.width + ix
+                    if self.component[n] == cid:
+                        candidates.add(n)
+        best, best_score = None, -float("inf")
+        for n in candidates:
+            px, py = self.points[n]
+            if not self.walkable(px, py) or math.hypot(px - cx, py - cy) > radius:
+                continue
+            travel = math.hypot(px - x, py - y)
+            if travel > max_d:
+                continue
+            z = self.ground(px, py)
+            cv = 0
+            for i, (ex, ey, ez) in enumerate(threats):
+                if not self._clear_sampled((ex, ey, ez), (px, py, z + self.height * 0.88), self.inv * 0.42):
+                    cv += (64, 38, 22)[i]
+            if not cv:
+                continue
+            sc = cv - 0.65 * travel + (10.0 if self._ground_line(pos, (px, py)) else 0.0)
+            if sc > best_score:
+                best, best_score = (px, py), sc
+        return best

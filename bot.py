@@ -258,23 +258,9 @@ class Bot:
         self.waypoint_until = t + 9
         return self.waypoint
 
-    def _shelter_exposed(self, shelter, enemies):
-        sx, sy = shelter[:2]
-        sz = self.arena.ground(sx, sy) + self.arena.height * 0.88
-        for e in enemies[:2]:
-            ex, ey, ez = e["pos"] if isinstance(e, dict) else e
-            muzzle = (self.arena.muzzle * (1 + self.arena.size_per_cube * e.get("cubes", 0))
-                      if isinstance(e, dict) else self.arena.muzzle)
-            if self.arena._clear_sampled((ex, ey, ez + muzzle), (sx, sy, sz), self.arena.inv * 0.42):
-                return True
-        return False
-
     def protect(self, pos, enemies, zone, t):
         center, radius = future_ring(zone, t, 8)
-        compromised = (self.shelter is not None and bool(enemies)
-                       and (distance(pos, self.shelter) < 4.5 or t - self.last_damage < 0.35)
-                       and self._shelter_exposed(self.shelter, enemies))
-        if compromised or t >= self.shelter_until or (self.shelter is not None and distance(self.shelter, center) > radius):
+        if t >= self.shelter_until or (self.shelter is not None and distance(self.shelter, center) > radius):
             self.shelter = self.arena.cover(pos, enemies, center, max(1, radius - min(4, radius*0.1)), retreat=True)
             self.shelter_until = t + 1.25
         return self.shelter
@@ -354,8 +340,12 @@ class Bot:
         if attackers and hurt_or_focused and zone["radius"] > 16:
             escape = self.protect(pos, attackers, zone, t)
             if escape is not None:
-                return "retreat", escape, None, 1.0, trading or (self.recovering and not threats)
-            if outnumbered or not known or (self.recovering and hp < 0.35):
+                beam_aimed = any(m.get("charging") and math.cos(
+                    m["aim"][0] - math.atan2(pos[1] - m["pos"][1], pos[0] - m["pos"][0])
+                ) > 0.90 for m in threats)
+                rmode = "duck_beam" if (beam_aimed and distance(pos, escape) <= 15.0) else "retreat"
+                return rmode, escape, None, 1.0, trading or (self.recovering and not threats)
+            if outnumbered or not known:
                 dx, dy = unit(pos[0] - attackers[0]["pos"][0], pos[1] - attackers[0]["pos"][1])
                 escape = inside_goal((pos[0]+35*dx, pos[1]+35*dy), center, radius*0.92)
                 return "retreat", escape, None, 0, trading
@@ -377,7 +367,7 @@ class Bot:
             easy = distance(pos, obj["pos"]) <= (16 if group == "cubes" else 21)
             if not threats or (group in ("pickups","cubes","drop") and easy and closest > 16 and value > 0.8):
                 self.remember_goal(loot, obs)
-                if self.recovering and (group in ("crates", "npc") or (hp < 0.45 and group != "drop" and distance(pos, obj["pos"]) > 16)):
+                if self.recovering and group in ("crates", "npc"):
                     return "heal", pos, None, 1.5, True
                 if group in ("crates", "npc") and abs(obj["pos"][2] - pos[2]) < 4:
                     # The pitch limit leaves a blind spot at the mech's feet.
@@ -412,8 +402,11 @@ class Bot:
             if dead_window or enemy_charging_at_me or laser_peek_duck:
                 duck = self.protect(pos, threats, zone, t)
                 max_d = 18.0 if dead_window else (14.0 if enemy_charging_at_me else 12.0)
+                if duck is None or distance(pos, duck) > max_d:
+                    c8, r8 = future_ring(zone, t, 8)
+                    duck = self.arena.short_cover(pos, threats, c8, max(1, r8 - min(4, r8 * 0.1)), max_d)
                 if duck is not None and distance(pos, duck) <= max_d:
-                    return "retreat", duck, None, 1.0, False
+                    return ("duck_beam" if enemy_charging_at_me else "duck"), duck, None, 1.0, False
             return "duel", threats[0]["pos"], None, 0, False
         self.remember_goal(None, obs)
         if self.recovering:
@@ -436,7 +429,9 @@ class Bot:
         threats, known = self.threat_list(obs)
         mode, goal, focus, anchor, quiet = self.plan(obs, threats, known)
         self.mode = mode
-        action = self.combat.act(obs, self.arena, focus, quiet)
+        pos = obs["self"]["pos"]
+        ducking = (mode in ("duck", "duck_beam") and distance(pos, goal) > 2.0)
+        action = self.combat.act(obs, self.arena, focus, quiet, ducking=ducking)
         primary = self.combat.target
         if primary is None or primary.get("kind") != "mech":
             primary = threats[0] if threats else None
