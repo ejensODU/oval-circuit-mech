@@ -562,50 +562,27 @@ class Arena:
                 best, best_score = (px,py), score
         return best
 
-    def short_cover(self, pos, enemies, center, radius, max_d=14.0):
-        """Fallback close-range cover search <= max_d when cover() picked a farther point."""
+    def peek_spot(self, pos, target, center, radius):
+        """Nearest ground point <= 20 m with clear shot on wounded target."""
         x, y = pos[:2]
-        start = self._nearest(pos)
-        if start is None or not enemies:
-            return None
-        cid = self.component[start]
-        threats = []
-        for enemy in enemies:
-            ex, ey, ez = enemy["pos"]
-            muzzle = self.muzzle * (1 + self.size_per_cube * enemy.get("cubes", 0))
-            threats.append((ex, ey, ez + muzzle))
-        threats.sort(key=lambda e: math.dist(e[:2], (x, y)))
-        threats = threats[:3]
+        tx, ty, tz = target["pos"]
+        th = self.base_height * (1 + self.size_per_cube * target.get("cubes", 0))
+        aim_pt = (tx, ty, tz + 0.55 * th)
+        my_muzzle = self.muzzle * (self.height / max(1.0, self.base_height))
         cx, cy = center[:2]
-        candidates = set()
-        for length in (4.5, 8.5, 13.0, 17.0):
-            if length > max_d + 1.0:
-                continue
+        best, best_d = None, float("inf")
+        for length in (7.0, 13.0, 20.0):
             for k in range(12):
-                angle = (k + (int(length) % 3) * 0.2) * math.tau / 12
-                px, py = x + length * math.cos(angle), y + length * math.sin(angle)
-                ix = round((px - self.ox) / self.gap)
-                iy = round((py - self.oy) / self.gap)
-                if 0 <= ix < self.width and 0 <= iy < self.rows:
-                    n = iy * self.width + ix
-                    if self.component[n] == cid:
-                        candidates.add(n)
-        best, best_score = None, -float("inf")
-        for n in candidates:
-            px, py = self.points[n]
-            if not self.walkable(px, py) or math.hypot(px - cx, py - cy) > radius:
-                continue
-            travel = math.hypot(px - x, py - y)
-            if travel > max_d:
-                continue
-            z = self.ground(px, py)
-            cv = 0
-            for i, (ex, ey, ez) in enumerate(threats):
-                if not self._clear_sampled((ex, ey, ez), (px, py, z + self.height * 0.88), self.inv * 0.42):
-                    cv += (64, 38, 22)[i]
-            if not cv:
-                continue
-            sc = cv - 0.65 * travel + (10.0 if self._ground_line(pos, (px, py)) else 0.0)
-            if sc > best_score:
-                best, best_score = (px, py), sc
+                a = (k + (int(length) % 3) * 0.25) * math.tau / 12
+                px, py = x + length * math.cos(a), y + length * math.sin(a)
+                if math.hypot(px - cx, py - cy) > radius or not self.walkable(px, py):
+                    continue
+                if not self._ground_line(pos, (px, py)):
+                    continue
+                pz = self.ground(px, py)
+                if self.clear((px, py, pz + my_muzzle), aim_pt):
+                    if length < best_d:
+                        best, best_d = (px, py), length
+            if best is not None:
+                return best
         return best

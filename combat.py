@@ -23,6 +23,7 @@ class Combat:
         self.sight = {}
         self.blocked_since = {}
         self.arc = {}
+        self.light_hold = False
 
     def _observe(self, obs):
         t = obs["t"]
@@ -212,7 +213,7 @@ class Combat:
         # behind a building. Keep the source in the armored front hemisphere.
         return angle_delta(self.last_bearing + 0.6 * math.sin(now * 1.7), 0)
 
-    def act(self, obs, arena, focus=None, quiet=False, ducking=False):
+    def act(self, obs, arena, focus=None, quiet=False):
         self._observe(obs)
         me, now = obs["self"], obs["t"]
         sx, sy, sz = me["pos"]
@@ -245,6 +246,7 @@ class Combat:
         laser = weapons.get("laser")
         laser_in_range = bool(laser and distance <= laser["stats"]["range"] + 2)
         laser_release = False
+        prealign = False
         if laser and laser_in_range and visible:
             charge = laser.get("charge", 0)
             stats = laser["stats"]
@@ -258,9 +260,10 @@ class Combat:
             desired = (hp / (stats["damage"] * multiplier) - stats["min_frac"]) / max(0.01, 1 - stats["min_frac"])
             goal_charge = max(stats["min_charge"], min(1, desired) * stats["charge"])
             laser_release = charge > 0 and charge >= goal_charge - self.tick_s * 0.45
+            prealign = charge > 0 and charge >= goal_charge - 0.1225
         command = direct
         if may_fire:
-            if laser_release or (ducking and laser and laser_in_range and visible and 0 < laser.get("charge", 0) < goal_charge - 0.15):
+            if laser_release or prealign:
                 command = direct
             elif "mortar" in wishes:
                 command = wishes["mortar"]
@@ -281,20 +284,18 @@ class Combat:
                 # Releasing is irreversible. Confirm the reported torso has
                 # actually reached the beam line after switching off gun lead.
                 on_beam = self._aligned(direct, actual, actual, me, radius, 0.42 * body_height, distance)
-                if ducking:
-                    ch = w.get("charge", 0.0)
-                    if ch <= 0.0:
-                        min_kill = obj.get("hp", math.inf) * 1.12 <= stats["damage"] * stats["min_frac"] * multiplier
-                        trigger[i] = min_kill
-                    else:
-                        early_ok = (ch < goal_charge - 0.15) and (ch >= stats["min_charge"])
-                        trigger[i] = not ((laser_release or early_ok) and aligned and on_beam)
-                else:
-                    trigger[i] = not (laser_release and aligned and on_beam)
+                trigger[i] = not (laser_release and aligned and on_beam)
             elif kind == "lightning":
-                trigger[i] = (visible and distance < stats["range"] + 0.3 and
+                cost = stats["energy"]
+                mult = 1 + self.config["cubes"]["damage_per_cube"] * min(me["cubes"], self.config["cubes"]["stat_cap"])
+                two_kill = obj.get("hp", 9999) <= 2.0 * stats["damage"] * mult
+                if me["energy"] < cost:
+                    self.light_hold = True
+                if self.light_hold and (me["energy"] >= max(10 * cost, 0.30 * me["max_energy"]) or two_kill):
+                    self.light_hold = False
+                trigger[i] = (not self.light_hold and visible and distance < stats["range"] + 0.3 and
                               abs(angle_delta(actual[0], direct[0])) < math.radians(stats["cone_deg"]) * 0.85
-                              and me["energy"] >= stats["energy"])
+                              and me["energy"] >= cost)
             elif kind == "mortar":
                 trigger[i] = aligned
         reload = False

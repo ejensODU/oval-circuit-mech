@@ -35,10 +35,18 @@ class Bot:
         self.waypoint_until = -1
         self.visits = {}
         self.mode = "explore"
+        self.start_alive = None
+        self.my_kills = 0
+        self.is_ffa = False
+        self.last_duel = None
+        self.finish_spot = None
+        self.finish_until = -1
 
     def remember(self, obs):
         t, me = obs["t"], obs["self"]
         pos = me["pos"]
+        if self.start_alive is None:
+            self.start_alive = obs.get("alive", 16)
         seen = set()
         for group in ("crates", "cubes", "pickups"):
             for item in obs[group]:
@@ -46,6 +54,8 @@ class Bot:
                 self.items[i] = (group, item, t)
                 seen.add(i)
         for e in obs["events"]:
+            if e["type"] == "kill":
+                self.my_kills += 1
             if e["type"] == "damaged" and e.get("weapon") != "zone":
                 self.last_damage = t
                 if e.get("bearing") is not None:
@@ -69,6 +79,10 @@ class Bot:
                     and distance(enemy["pos"], obs["zone"]["center"]) < obs["zone"]["radius"]):
                 self.enemy_hurt[i] = t
             self.enemy_hp[i] = enemy["hp"], t
+        if not self.is_ffa:
+            others_dead = (self.start_alive - obs.get("alive", self.start_alive)) - self.my_kills
+            if (others_dead >= 2 and t < 100) or len(self.enemy_hurt) >= 2:
+                self.is_ffa = True
         self.visits[(round(pos[0] / 28), round(pos[1] / 28))] = t
 
     def gear_value(self, kind, obs):
@@ -149,6 +163,7 @@ class Bot:
         armed = [w["kind"] for w in me["weapons"] if w]
         secondary = next((k for k in armed if k != "gun"), None)
         fraction = me["hp"] / me["max_hp"]
+        cube_cap = self.cfg["cubes"]["stat_cap"] if self.is_ffa else 15
         candidate, highest = None, 0
         objects = list(self.items.values())
         objects.extend(("npc", m, t) for m in obs["mechs"] if m["kind"] == "npc")
@@ -187,7 +202,7 @@ class Bot:
                 if wait > 9:
                     continue
                 worth = 16 + (1 - fraction) * 32
-                if me["cubes"] >= self.cfg["cubes"]["stat_cap"] and fraction > 0.9:
+                if me["cubes"] >= cube_cap and fraction > 0.9:
                     worth *= 0.52
                 travel += wait + max(0, item["capture_s"] - (item["progress"] if owner == me["id"] else 0))
             else:
@@ -198,7 +213,7 @@ class Bot:
                     worth += 3
                 if group != "cubes":
                     travel += 1 + item.get("hp", 300) / (230 if secondary else 150)
-                if me["cubes"] >= self.cfg["cubes"]["stat_cap"]:
+                if me["cubes"] >= cube_cap:
                     worth *= 0.30 if group != "cubes" else 0.48
             score = worth / (2.25 + travel + over)
             if self.item_goal == i:
@@ -336,15 +351,14 @@ class Bot:
                         trading = True
                         break
         hurt_or_focused = self.recovering or trading or (outnumbered and (under_fire or hp < 0.88 or aimed >= 2))
+        if (not self.is_ffa and len(threats) == 1 and not outnumbered and not trading
+                and me["hp"] > 450 and threats[0].get("hp", 9999) <= 340 and closest < 175):
+            hurt_or_focused = False
         attackers = threats or known or ([self.damage_source] if under_fire and self.damage_source else [])
         if attackers and hurt_or_focused and zone["radius"] > 16:
             escape = self.protect(pos, attackers, zone, t)
             if escape is not None:
-                beam_aimed = any(m.get("charging") and math.cos(
-                    m["aim"][0] - math.atan2(pos[1] - m["pos"][1], pos[0] - m["pos"][0])
-                ) > 0.90 for m in threats)
-                rmode = "duck_beam" if (beam_aimed and distance(pos, escape) <= 15.0) else "retreat"
-                return rmode, escape, None, 1.0, trading or (self.recovering and not threats)
+                return "retreat", escape, None, 1.0, trading or (self.recovering and not threats)
             if outnumbered or not known:
                 dx, dy = unit(pos[0] - attackers[0]["pos"][0], pos[1] - attackers[0]["pos"][1])
                 escape = inside_goal((pos[0]+35*dx, pos[1]+35*dy), center, radius*0.92)
@@ -352,10 +366,35 @@ class Bot:
         else:
             self.shelter = None
             self.shelter_until = -1
+        # Opus #4: 5-second kill window when a wounded duel target slips behind cover.
+        if not threats and not self.recovering and zone["radius"] > 22 and self.last_duel is not None:
+            duel_id, duel_t, duel_hp = self.last_duel
+            wounded = next((m for m in known if m["id"] == duel_id), None)
+            if wounded is None or t - duel_t > 5.0:
+                self.last_duel = None
+                self.finish_spot = None
+            else:
+                whp = wounded.get("hp", 9999)
+                has_laser = any(w and w["kind"] == "laser" for w in me["weapons"])
+                cube_mult = 1 + self.cfg["cubes"]["damage_per_cube"] * min(me["cubes"], self.cfg["cubes"]["stat_cap"])
+                thresh = (450.0 if has_laser else 300.0) * cube_mult
+                isolated = all(m["id"] == duel_id or distance(m["pos"], wounded["pos"]) >= 100.0 for m in known)
+                if whp > duel_hp + 1.0 or whp > thresh or not isolated:
+                    self.last_duel = None
+                    self.finish_spot = None
+                else:
+                    if whp < duel_hp:
+                        self.last_duel = (duel_id, duel_t, whp)
+                    if (self.finish_spot is None or t >= self.finish_until
+                            or distance(self.finish_spot, center) > max(1.0, radius - 4)):
+                        self.finish_spot = self.arena.peek_spot(pos, wounded, center, max(1.0, radius - 4))
+                        self.finish_until = t + 0.5
+                    if self.finish_spot is not None:
+                        return "finish", self.finish_spot, None, 0, False
         # Once equipped, expose ourselves for a useful pickup or a rotation.
-        # In a shrinking, quiet circle a sheltered edge costs less health.
+        # In a shrinking, quiet circle a sheltered edge costs less health (FFA only).
         equipped = all(me["weapons"]) and me["cubes"] >= 6
-        hold_ground = (not threats and 18 < radius < 150 and equipped and value < 0.95)
+        hold_ground = (self.is_ffa and not threats and 18 < radius < 150 and equipped and value < 0.95)
         if hold_ground:
             if self.hold is None or self.hold_until < t or distance(self.hold, center) > radius - 4:
                 self.hold = self.arena.cover(pos, [], center, radius-4)
@@ -402,11 +441,15 @@ class Bot:
             if dead_window or enemy_charging_at_me or laser_peek_duck:
                 duck = self.protect(pos, threats, zone, t)
                 max_d = 18.0 if dead_window else (14.0 if enemy_charging_at_me else 12.0)
-                if duck is None or distance(pos, duck) > max_d:
-                    c8, r8 = future_ring(zone, t, 8)
-                    duck = self.arena.short_cover(pos, threats, c8, max(1, r8 - min(4, r8 * 0.1)), max_d)
                 if duck is not None and distance(pos, duck) <= max_d:
-                    return ("duck_beam" if enemy_charging_at_me else "duck"), duck, None, 1.0, False
+                    return "retreat", duck, None, 1.0, False
+            duel_tgt = threats[0]
+            if self.combat.target and self.combat.target.get("kind") == "mech":
+                match_t = next((m for m in threats if m["id"] == self.combat.target["id"]), None)
+                if match_t is not None:
+                    duel_tgt = match_t
+            self.last_duel = (duel_tgt["id"], t, duel_tgt.get("hp", 9999))
+            self.finish_spot = None
             return "duel", threats[0]["pos"], None, 0, False
         self.remember_goal(None, obs)
         if self.recovering:
@@ -429,9 +472,7 @@ class Bot:
         threats, known = self.threat_list(obs)
         mode, goal, focus, anchor, quiet = self.plan(obs, threats, known)
         self.mode = mode
-        pos = obs["self"]["pos"]
-        ducking = (mode in ("duck", "duck_beam") and distance(pos, goal) > 2.0)
-        action = self.combat.act(obs, self.arena, focus, quiet, ducking=ducking)
+        action = self.combat.act(obs, self.arena, focus, quiet)
         primary = self.combat.target
         if primary is None or primary.get("kind") != "mech":
             primary = threats[0] if threats else None

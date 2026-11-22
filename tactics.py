@@ -127,7 +127,7 @@ class Footwork:
             self.jet_until = t + 0.58
 
         active_jet = t < self.jet_until
-        mobile = mode in ("duel", "retreat", "rotate", "duck", "duck_beam") or (moving and target_dist > 16)
+        mobile = mode in ("duel", "retreat", "rotate", "finish") or (moving and target_dist > 16)
         reserve = 24 if mode == "duel" else 13
         if climbing:
             reserve = min(me["max_energy"] * 0.93, max(39, 15 + (altitude - pos[2]) * 2.1))
@@ -135,12 +135,14 @@ class Footwork:
             self.boosting = False
         if me["energy"] > reserve + 28:
             self.boosting = True
-        urgent_beam = (mode == "duck_beam" and not climbing and me["energy"] > 8)
-        boost = active_jet or (ground and mobile and (self.boosting or urgent_beam) and moving)
-        # A leap changes vertical velocity in time for slower, distant rounds.
+        boost = active_jet or (ground and mobile and self.boosting and moving)
+        # Opus #6: Treat energy as lightning ammo inside lightning fights (unless dodging mortar shells).
+        if mode == "duel" and enemy is not None and not shells:
+            ltw = next((w for w in me["weapons"] if w and w["kind"] == "lightning"), None)
+            if ltw is not None and distance(pos, enemy["pos"]) <= ltw["stats"]["range"] + 12.0:
+                boost = active_jet
+        # Opus #5: No bullet jumps (stay grounded at 58.5 m/s^2 + boost instead of 12 m/s^2 airborne).
         jump = active_jet and ground
-        if ground and not anchor_radius and not climbing and any(b[0] > 0.33 for b in bullets):
-            jump = True
         if jump and not active_jet:
             boost = False
 
