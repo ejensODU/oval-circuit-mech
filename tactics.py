@@ -34,9 +34,9 @@ class Footwork:
         self.last_sample = None
         self.stuck_since = -1000
 
-    def orbit(self, pos, enemy, me, t):
+    def orbit(self, pos, enemy, me, t, arena=None):
         # A wide strafe across the other mech's view works with all loadouts.
-        # Avoid reversing every tick: ground acceleration is finite.
+        # Tether gently toward nearby building cover so reload/laser-duck cover stays within 1 stride!
         axis = unit(enemy["pos"][0] - pos[0], enemy["pos"][1] - pos[1])
         kinds = {w["kind"]: w["stats"] for w in me["weapons"] if w}
         distance_now = distance(pos, enemy["pos"])
@@ -46,6 +46,14 @@ class Footwork:
         elif "lightning" in enemy.get("weapons", []):
             ideal = 117
         side = 1 if math.sin(t * 1.05 + self.phase + 0.55 * math.sin(t * 0.7)) >= 0 else -1
+        if arena is not None and "lightning" not in kinds:
+            lx, ly = -axis[1], axis[0]
+            cl_pos = arena.ground_clearance(pos[0] + lx * 8.0, pos[1] + ly * 8.0)
+            cl_neg = arena.ground_clearance(pos[0] - lx * 8.0, pos[1] - ly * 8.0)
+            if side == 1 and cl_pos > 16.0 and 2.8 <= cl_neg <= 11.0 and arena.open_step(pos, (-lx, -ly), 6.0):
+                side = -1
+            elif side == -1 and cl_neg > 16.0 and 2.8 <= cl_pos <= 11.0 and arena.open_step(pos, (lx, ly), 6.0):
+                side = 1
         radial = max(-1.65, min(1.35, (distance_now - ideal) / 24))
         return unit(radial * axis[0] - side * axis[1], radial * axis[1] + side * axis[0])
 
@@ -86,7 +94,7 @@ class Footwork:
         target_dist = distance(pos, goal)
         face_ahead = False
         if mode == "duel" and enemy is not None:
-            desired = self.orbit(pos, enemy, me, t)
+            desired = self.orbit(pos, enemy, me, t, arena)
         elif climbing and target_dist < 12:
             desired = unit(goal[0] - pos[0], goal[1] - pos[1])
         else:

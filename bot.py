@@ -9,7 +9,7 @@ from tactics import Footwork, distance, future_ring, inside_goal, unit
 
 
 class Bot:
-    name = "Oval Circuit-exp3"
+    name = "Oval Circuit"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -79,12 +79,15 @@ class Bot:
             return 4.7 if obs["zone"]["radius"] < 60 else 3.65
         return {"mortar": 2.85, "gun": 3.1}.get(kind, 0)
 
-    def equipment(self, obs):
+    def equipment(self, obs, threats=()):
         me = obs["self"]
         held = [w["kind"] if w else None for w in me["weapons"]]
+        laser_danger = any("laser" in m.get("weapons", ()) for m in threats)
         take = {}
         best = 0
         for p in obs["pickups"]:
+            if p["kind"] == "mortar" and laser_danger:
+                continue
             if p["kind"] in held or distance(p["pos"], me["pos"]) >= self.cfg["loot"]["pickup_radius"]:
                 continue
             if abs(p["pos"][2] - me["pos"][2]) >= 4:
@@ -103,6 +106,9 @@ class Bot:
                 take = {"take": p["id"]}
                 if held[slot]:
                     take["drop"] = slot
+        # Anti-cookoff: drop mortar immediately if a visible enemy holds a laser!
+        if not take and "mortar" in held and laser_danger:
+            take = {"drop": held.index("mortar")}
         return take
 
     def upgrade(self, obs):
@@ -122,10 +128,7 @@ class Bot:
             values["lightning_efficiency"] += 1.0
         if "nanites" in me["upgrades"]:
             values["nanites"] -= 0.8
-        choices = obs["offer"].get("choices") or []
-        if not choices:
-            return None
-        return max(enumerate(choices), key=lambda it: values.get(it[1]["id"], 4))[0]
+        return max(enumerate(obs["offer"]["choices"]), key=lambda it: values.get(it[1]["id"], 4))[0]
 
     def threat_list(self, obs):
         me = obs["self"]
@@ -169,6 +172,8 @@ class Bot:
             owner = None
             if group == "pickups":
                 if item["kind"] in armed:
+                    continue
+                if item["kind"] == "mortar" and any("laser" in m.get("weapons", ()) for m in enemies):
                     continue
                 gain = self.gear_value(item["kind"], obs) - (self.gear_value(secondary, obs) if secondary else 0)
                 if gain <= 0.1:
@@ -330,15 +335,16 @@ class Bot:
                     if math.cos(shooter["aim"][0] - bearing) > 0.97:
                         trading = True
                         break
-        hurt_or_focused = bool(threats) or self.recovering or trading or under_fire or (outnumbered and (under_fire or hp < 0.88 or aimed >= 2))
+        hurt_or_focused = self.recovering or trading or (outnumbered and (under_fire or hp < 0.88 or aimed >= 2))
         attackers = threats or known or ([self.damage_source] if under_fire and self.damage_source else [])
         if attackers and hurt_or_focused and zone["radius"] > 16:
             escape = self.protect(pos, attackers, zone, t)
             if escape is not None:
                 return "retreat", escape, None, 1.0, trading or (self.recovering and not threats)
-            dx, dy = unit(pos[0] - attackers[0]["pos"][0], pos[1] - attackers[0]["pos"][1])
-            escape = inside_goal((pos[0]+35*dx, pos[1]+35*dy), center, radius*0.92)
-            return "retreat", escape, None, 0, trading
+            if outnumbered or not known:
+                dx, dy = unit(pos[0] - attackers[0]["pos"][0], pos[1] - attackers[0]["pos"][1])
+                escape = inside_goal((pos[0]+35*dx, pos[1]+35*dy), center, radius*0.92)
+                return "retreat", escape, None, 0, trading
         else:
             self.shelter = None
             self.shelter_until = -1
@@ -372,6 +378,28 @@ class Bot:
                         obj if group in ("crates", "npc") else None,
                         obj.get("radius", 6) * 0.48 if group == "drop" else 0, self.recovering)
         if threats:
+            w_by_k = {w["kind"]: w for w in me["weapons"] if w}
+            gw = w_by_k.get("gun")
+            lw = w_by_k.get("laser")
+            ltw = w_by_k.get("lightning")
+            in_light = bool(ltw and closest <= ltw["stats"]["range"] + 4 and me["energy"] >= ltw["stats"]["energy"])
+            dead_window = (not in_light and closest > 45.0 and zone["radius"] > 22
+                           and (gw is None or gw.get("reload", 0.0) > 0.55)
+                           and (lw is None or (lw.get("charge", 0.0) <= 0.0 and lw.get("cooldown", 0.0) > 0.65)))
+            enemy_charging_at_me = (not in_light and closest > 45.0 and zone["radius"] > 22
+                                    and (lw is None or lw.get("charge", 0.0) < 0.45)
+                                    and any(m.get("charging") and math.cos(
+                                        m["aim"][0] - math.atan2(pos[1] - m["pos"][1], pos[0] - m["pos"][0])
+                                    ) > 0.90 for m in threats))
+            laser_peek_duck = (not in_light and lw is not None and lw.get("charge", 0.0) <= 0.0
+                               and lw.get("cooldown", 0.0) > 0.65 and zone["radius"] > 22
+                               and (len(threats) >= 2 or closest > 135.0 or hp < 0.72)
+                               and not any(m.get("hp", 1400) <= 350 for m in threats))
+            if dead_window or enemy_charging_at_me or laser_peek_duck:
+                duck = self.protect(pos, threats, zone, t)
+                max_d = 18.0 if dead_window else (14.0 if enemy_charging_at_me else 12.0)
+                if duck is not None and distance(pos, duck) <= max_d:
+                    return "retreat", duck, None, 1.0, False
             return "duel", threats[0]["pos"], None, 0, False
         self.remember_goal(None, obs)
         if self.recovering:
@@ -381,6 +409,14 @@ class Bot:
         return "explore", self.explore(obs), None, 0, False
 
     def act(self, obs):
+        try:
+            return self._act_inner(obs)
+        except Exception:
+            me = obs.get("self", {})
+            return {"tick": obs.get("tick", 0), "move": [0.0, 0.0], "boost": False, "jump": False,
+                    "aim": list(me.get("aim", [0.0, 0.0])), "fire": [False, False], "reload": False}
+
+    def _act_inner(self, obs):
         self.arena.set_body(obs["self"]["stats"])
         self.remember(obs)
         threats, known = self.threat_list(obs)
@@ -414,7 +450,7 @@ class Bot:
             if len(goal) == 3:
                 climbing = (goal[2] > self.arena.ground(*goal[:2]) + 3.8 and (goal[2] > pos[2] + 0.4 or (not obs["self"]["grounded"] and pos[2] < goal[2] + 1.5)))
         action.update(self.feet.move(obs, self.arena, goal, mode, primary, climbing, anchor))
-        action.update(self.equipment(obs))
+        action.update(self.equipment(obs, threats))
         if obs.get("offer"):
             pick = self.upgrade(obs)
             if pick is not None:

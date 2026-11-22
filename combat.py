@@ -225,12 +225,14 @@ class Combat:
         gun = weapons.get("gun")
         if obj is None:
             return {"aim": [self._scan_yaw(now, actual[0]), 0.0], "fire": trigger,
-                    "reload": bool(gun and gun.get("ammo", 0) <= gun["stats"]["mag"] - 2 and gun.get("reload", 0) == 0)}
+                    "reload": bool(gun and gun["ammo"] <= gun["stats"]["mag"] - 2 and gun["reload"] == 0)}
         distance = math.dist(me["pos"], obj["pos"])
         direct = bearing(origin, self._point(obj, height, self.tick_s * 0.35))
         is_mech = obj.get("kind") == "mech"
-        # Exp 3 A/B test: never fire at mechs (still aim at them for front armor; still shoot crates/NPCs to farm)
-        may_fire = (not is_mech) and (not quiet)
+        urgent = (is_mech and (distance < 27 or
+                  (obj.get("hp", 10000) < 160 and distance < 100) or
+                  (distance < 75 and now - self.attacks.get(obj["id"], -100) < 1.2)))
+        may_fire = not quiet or urgent
         wishes = {"laser": direct, "lightning": direct}
         gun_in_range = bool(gun and distance <= gun["stats"]["range"] + 2)
         if gun and visible:
@@ -249,6 +251,9 @@ class Combat:
             multiplier = 1 + self.config["cubes"]["damage_per_cube"] * min(me["cubes"], self.config["cubes"]["stat_cap"])
             if "mortar" in obj.get("weapons", ()):
                 multiplier *= 1 + stats["cookoff"]
+            # Avoid waiting for full charge when a partial beam will finish.
+            # Health is public only on some configurations, and the target
+            # may have armor, so leave a small margin.
             hp = obj.get("hp", math.inf) * 1.12
             desired = (hp / (stats["damage"] * multiplier) - stats["min_frac"]) / max(0.01, 1 - stats["min_frac"])
             goal_charge = max(stats["min_charge"], min(1, desired) * stats["charge"])
@@ -259,7 +264,7 @@ class Combat:
                 command = direct
             elif "mortar" in wishes:
                 command = wishes["mortar"]
-            elif gun_in_range and visible and gun.get("reload", 0) < 0.15:
+            elif gun_in_range and visible and gun["reload"] < 0.15:
                 command = wishes["gun"]
         if not visible and "mortar" not in wishes and now - self.blocked_since.get(obj["id"], now) >= 0.65:
             command = (self._scan_yaw(now, actual[0]), 0)
@@ -271,8 +276,10 @@ class Combat:
             kind, stats = w["kind"], w["stats"]
             aligned = self._aligned(wishes.get(kind), actual, command, me, radius + 0.30, 0.42 * body_height, distance)
             if kind == "gun":
-                trigger[i] = visible and gun_in_range and aligned and w.get("reload", 0) == 0 and w.get("ammo", 0) > 0
+                trigger[i] = visible and gun_in_range and aligned and w["reload"] == 0 and w["ammo"] > 0
             elif kind == "laser" and laser_in_range and visible:
+                # Releasing is irreversible. Confirm the reported torso has
+                # actually reached the beam line after switching off gun lead.
                 on_beam = self._aligned(direct, actual, actual, me, radius, 0.42 * body_height, distance)
                 trigger[i] = not (laser_release and aligned and on_beam)
             elif kind == "lightning":
@@ -282,7 +289,7 @@ class Combat:
             elif kind == "mortar":
                 trigger[i] = aligned
         reload = False
-        if gun and gun.get("reload", 0) == 0 and gun.get("ammo", 0) < gun["stats"]["mag"]:
-            reload = gun.get("ammo", 0) <= 0 or (not any(trigger) and
-                (quiet or not gun_in_range or (not visible and gun.get("ammo", 0) <= gun["stats"]["mag"] * 0.68)))
+        if gun and gun["reload"] == 0 and gun["ammo"] < gun["stats"]["mag"]:
+            reload = gun["ammo"] <= 0 or (not any(trigger) and
+                ((quiet and not urgent) or not gun_in_range or (not visible and gun["ammo"] <= gun["stats"]["mag"] * 0.68)))
         return {"aim": list(command), "fire": trigger, "reload": reload}
