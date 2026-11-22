@@ -35,10 +35,6 @@ class Bot:
         self.waypoint_until = -1
         self.visits = {}
         self.mode = "explore"
-        self.total_mechs = self.cfg.get("match", {}).get("mechs", 16)
-        self.start_alive = None
-        self.my_kills = 0
-        self.is_ffa = False
 
     def remember(self, obs):
         t, me = obs["t"], obs["self"]
@@ -57,14 +53,6 @@ class Bot:
                     self.damage_source = {"pos": (pos[0] + 70 * math.cos(yaw), pos[1] + 70 * math.sin(yaw), pos[2])}
             if e["type"] == "took" or (e["type"] == "take_failed" and e.get("reason") in ("gone", "have")):
                 self.items.pop(e["id"], None)
-            if e["type"] == "kill":
-                self.my_kills += 1
-        alive_now = obs.get("alive", self.total_mechs)
-        if self.start_alive is None:
-            self.start_alive = alive_now
-        other_deaths = (self.start_alive - alive_now) - self.my_kills
-        if (other_deaths >= 3 and t < 240) or other_deaths >= 4:
-            self.is_ffa = True
         for i, (group, item, last) in list(self.items.items()):
             if i in seen:
                 continue
@@ -201,8 +189,6 @@ class Bot:
                 worth = 16 + (1 - fraction) * 32
                 if me["cubes"] >= self.cfg["cubes"]["stat_cap"] and fraction > 0.9:
                     worth *= 0.52
-                if (t > 115 and (len(enemies) >= 2 or (enemies and me["cubes"] >= 10))) or sum(distance(e["pos"], p) < 150 for e in enemies) >= 3:
-                    worth *= 0.15
                 travel += wait + max(0, item["capture_s"] - (item["progress"] if owner == me["id"] else 0))
             else:
                 worth = {"crates": 6.8, "cubes": 8.4, "npc": 10.8}[group]
@@ -272,9 +258,23 @@ class Bot:
         self.waypoint_until = t + 9
         return self.waypoint
 
+    def _shelter_exposed(self, shelter, enemies):
+        sx, sy = shelter[:2]
+        sz = self.arena.ground(sx, sy) + self.arena.height * 0.88
+        for e in enemies[:2]:
+            ex, ey, ez = e["pos"] if isinstance(e, dict) else e
+            muzzle = (self.arena.muzzle * (1 + self.arena.size_per_cube * e.get("cubes", 0))
+                      if isinstance(e, dict) else self.arena.muzzle)
+            if self.arena._clear_sampled((ex, ey, ez + muzzle), (sx, sy, sz), self.arena.inv * 0.42):
+                return True
+        return False
+
     def protect(self, pos, enemies, zone, t):
         center, radius = future_ring(zone, t, 8)
-        if t >= self.shelter_until or (self.shelter is not None and distance(self.shelter, center) > radius):
+        compromised = (self.shelter is not None and bool(enemies)
+                       and (distance(pos, self.shelter) < 4.5 or t - self.last_damage < 0.35)
+                       and self._shelter_exposed(self.shelter, enemies))
+        if compromised or t >= self.shelter_until or (self.shelter is not None and distance(self.shelter, center) > radius):
             self.shelter = self.arena.cover(pos, enemies, center, max(1, radius - min(4, radius*0.1)), retreat=True)
             self.shelter_until = t + 1.25
         return self.shelter
@@ -283,10 +283,7 @@ class Bot:
         me, zone, t = obs["self"], obs["zone"], obs["t"]
         pos = me["pos"]
         hp = me["hp"] / me["max_hp"]
-        alive = obs.get("alive", 16)
-        rec_lo = 0.72 if (self.is_ffa and alive > 3) else 0.60
-        rec_hi = 0.93 if (self.is_ffa and alive > 3) else 0.91
-        self.recovering = (hp < rec_lo or (self.recovering and hp < rec_hi)) and me["in_zone"]
+        self.recovering = (hp < 0.60 or (self.recovering and hp < 0.91)) and me["in_zone"]
         if self.recovering and zone["radius"] < 20:
             self.recovering = False
         center, radius = future_ring(zone, t, 15)
@@ -331,15 +328,9 @@ class Bot:
             drop = loot[1]
             radius_cap = drop["radius"]
             capturing = distance(pos, drop["pos"]) < radius_cap and drop["lands_in"] < 1
-            rem_cap = drop["lands_in"] + max(0.0, drop["capture_s"] - (drop["progress"] if drop.get("holder") == me["id"] else 0.0))
-            drop_trap = (
-                (len(threats) >= 3 and rem_cap > 0.5)
-                or (len(threats) >= 2 and rem_cap > 0.7 and (t > 115 or hp > 0.68))
-                or (t > 115 and bool(threats) and me["cubes"] >= 12 and rem_cap > 0.9)
-            )
-            if not drop_trap and (capturing or hp < 0.72) and closest > (15 if capturing else 42) and value > 0.65:
+            if (capturing or hp < 0.72) and closest > (15 if capturing else 42) and value > 0.65:
                 self.remember_goal(loot, obs)
-                return "capture", drop["pos"], None, radius_cap * 0.47, self.recovering and not threats
+                return "capture", drop["pos"], None, radius_cap * 0.47, self.recovering
         under_fire = t - self.last_damage < 2.8
         outnumbered = sum(distance(pos, m["pos"]) < 130 for m in threats) >= 2
         aimed = sum(math.cos(m["aim"][0] - math.atan2(pos[1] - m["pos"][1], pos[0] - m["pos"][0])) > 0.92 for m in threats)
@@ -358,15 +349,13 @@ class Bot:
                     if math.cos(shooter["aim"][0] - bearing) > 0.97:
                         trading = True
                         break
-        if self.is_ffa and alive > 3 and len(threats) >= 2 and not under_fire and not aimed:
-            trading = True
         hurt_or_focused = self.recovering or trading or (outnumbered and (under_fire or hp < 0.88 or aimed >= 2))
         attackers = threats or known or ([self.damage_source] if under_fire and self.damage_source else [])
         if attackers and hurt_or_focused and zone["radius"] > 16:
             escape = self.protect(pos, attackers, zone, t)
             if escape is not None:
                 return "retreat", escape, None, 1.0, trading or (self.recovering and not threats)
-            if outnumbered or not known:
+            if outnumbered or not known or (self.recovering and hp < 0.35):
                 dx, dy = unit(pos[0] - attackers[0]["pos"][0], pos[1] - attackers[0]["pos"][1])
                 escape = inside_goal((pos[0]+35*dx, pos[1]+35*dy), center, radius*0.92)
                 return "retreat", escape, None, 0, trading
@@ -375,12 +364,8 @@ class Bot:
             self.shelter_until = -1
         # Once equipped, expose ourselves for a useful pickup or a rotation.
         # In a shrinking, quiet circle a sheltered edge costs less health.
-        if self.is_ffa and alive > 3:
-            equipped = all(me["weapons"]) and me["cubes"] >= 4
-            hold_ground = (not threats and 18 < radius < 240 and equipped and value < 1.15)
-        else:
-            equipped = all(me["weapons"]) and me["cubes"] >= 6
-            hold_ground = (not threats and 18 < radius < 150 and equipped and value < 0.95)
+        equipped = all(me["weapons"]) and me["cubes"] >= 6
+        hold_ground = (not threats and 18 < radius < 150 and equipped and value < 0.95)
         if hold_ground:
             if self.hold is None or self.hold_until < t or distance(self.hold, center) > radius - 4:
                 self.hold = self.arena.cover(pos, [], center, radius-4)
@@ -390,10 +375,9 @@ class Bot:
         if loot:
             group, obj = loot
             easy = distance(pos, obj["pos"]) <= (16 if group == "cubes" else 21)
-            safe_drop = (group != "drop") or not ((t > 115 and bool(threats) and (len(threats) >= 2 or me["cubes"] >= 12)) or len(threats) >= 3)
-            if (not threats and safe_drop) or (safe_drop and group in ("pickups","cubes","drop") and easy and closest > 16 and value > 0.8):
+            if not threats or (group in ("pickups","cubes","drop") and easy and closest > 16 and value > 0.8):
                 self.remember_goal(loot, obs)
-                if self.recovering and group in ("crates", "npc"):
+                if self.recovering and (group in ("crates", "npc") or (hp < 0.45 and group != "drop" and distance(pos, obj["pos"]) > 16)):
                     return "heal", pos, None, 1.5, True
                 if group in ("crates", "npc") and abs(obj["pos"][2] - pos[2]) < 4:
                     # The pitch limit leaves a blind spot at the mech's feet.
