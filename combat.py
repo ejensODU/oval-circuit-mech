@@ -19,6 +19,7 @@ class Combat:
         self.attacks = {}
         self.last_bearing = None
         self.bearing_until = -1
+        self.rear_snap = (None, -1.0)
         self.scan_sign = 1 if hello["seed"] % 2 else -1
         self.sight = {}
         self.blocked_since = {}
@@ -31,6 +32,8 @@ class Combat:
                 self.last_bearing = e["bearing"]
                 self.bearing_until = t + 1.1
                 self.attacks[e.get("by")] = t
+                if e.get("rear"):
+                    self.rear_snap = (e["bearing"], t + 0.85)
         if self.bearing_until < t:
             cues = [s for s in obs["sounds"] if s["kind"] in
                     ("laser_charge", "gun", "laser", "mortar", "boost", "step", "lightning")]
@@ -245,6 +248,7 @@ class Combat:
         laser = weapons.get("laser")
         laser_in_range = bool(laser and distance <= laser["stats"]["range"] + 2)
         laser_release = False
+        goal_charge = laser["stats"]["charge"] if laser else 0.75
         if laser and laser_in_range and visible:
             charge = laser.get("charge", 0)
             stats = laser["stats"]
@@ -266,6 +270,41 @@ class Combat:
                 command = wishes["mortar"]
             elif gun_in_range and visible and gun["reload"] < 0.15:
                 command = wishes["gun"]
+        # Thales' theorem threat-arc rear-armor shield while no weapon can fire (1v2+)
+        light = weapons.get("lightning")
+        light_in_range = bool(light and visible and distance < light["stats"]["range"] + 2.0 and me["energy"] >= light["stats"]["energy"])
+        if not light_in_range:
+            ready_in = 99.0
+            if gun and gun_in_range:
+                ready_in = min(ready_in, 0.0 if (gun["ammo"] > 0 and gun["reload"] == 0) else gun["reload"])
+            if laser and laser_in_range:
+                l_cd = laser.get("cooldown", 0.0)
+                l_ch = laser.get("charge", 0.0)
+                ready_in = min(ready_in, l_cd + max(0.0, goal_charge - l_ch))
+            if "mortar" in wishes:
+                ready_in = 0.0
+            near_mechs = [m for m in obs["mechs"] if m.get("kind") == "mech" and math.dist(me["pos"], m["pos"]) <= 160.0]
+            if len(near_mechs) >= 2 and ready_in > 0.20:
+                bs = sorted(math.atan2(m["pos"][1] - sy, m["pos"][0] - sx) for m in near_mechs)
+                best_gap, best_idx = -1.0, 0
+                for idx in range(len(bs)):
+                    nxt = bs[(idx + 1) % len(bs)] + (math.tau if idx + 1 == len(bs) else 0.0)
+                    gap = nxt - bs[idx]
+                    if gap > best_gap:
+                        best_gap, best_idx = gap, idx
+                span = math.tau - best_gap
+                if span <= math.pi - 0.2:
+                    start_b = bs[(best_idx + 1) % len(bs)]
+                    arc_yaw = angle_delta(start_b + span * 0.5, 0.0)
+                else:
+                    top_m = min(near_mechs, key=lambda m: (
+                        0 if m.get("charging") else (1 if "laser" in m.get("weapons", ()) else 2),
+                        math.dist(me["pos"], m["pos"])
+                    ))
+                    arc_yaw = math.atan2(top_m["pos"][1] - sy, top_m["pos"][0] - sx)
+                turn_back = abs(angle_delta(command[0], arc_yaw)) / max(0.5, me["stats"]["turn_rate"])
+                if ready_in > turn_back + 0.15:
+                    command = (arc_yaw, command[1])
         if not visible and "mortar" not in wishes and now - self.blocked_since.get(obj["id"], now) >= 0.65:
             command = (self._scan_yaw(now, actual[0]), 0)
         command = (command[0], min(me["stats"]["max_pitch"], max(me["stats"]["min_pitch"], command[1])))
@@ -288,6 +327,9 @@ class Combat:
                               and me["energy"] >= stats["energy"])
             elif kind == "mortar":
                 trigger[i] = aligned
+        if not any(trigger) and self.rear_snap[0] is not None and now < self.rear_snap[1]:
+            if not (laser and laser.get("charge", 0) > 0):
+                command = (self.rear_snap[0], 0.0)
         reload = False
         if gun and gun["reload"] == 0 and gun["ammo"] < gun["stats"]["mag"]:
             reload = gun["ammo"] <= 0 or (not any(trigger) and
