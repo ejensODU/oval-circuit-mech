@@ -35,24 +35,31 @@ class Footwork:
         self.stuck_since = -1000
 
     def orbit(self, pos, enemy, me, t, arena=None):
-        # A wide strafe across the other mech's view works with all loadouts.
-        # Tether gently toward nearby building cover so reload/laser-duck cover stays within 1 stride!
+        # Long-range dynamic kiting: out-range enemy bullets & with sensors out-vision 200 m bots!
         axis = unit(enemy["pos"][0] - pos[0], enemy["pos"][1] - pos[1])
         kinds = {w["kind"]: w["stats"] for w in me["weapons"] if w}
         distance_now = distance(pos, enemy["pos"])
-        ideal = 125 if "laser" in kinds else 115
+        vision_r = 200.0 + me["stats"].get("vision_bonus", 0.0)
         if "lightning" in kinds:
             ideal = kinds["lightning"]["range"] * 0.72
-        elif "lightning" in enemy.get("weapons", []):
-            ideal = 117
+        elif "laser" in kinds:
+            ideal = min(vision_r - 12.0, 224.0)
+            if enemy.get("hp", 1400) <= 450:
+                ideal = min(ideal, 155.0)
+        else:
+            ideal = 152.0
+            if "lightning" in enemy.get("weapons", []):
+                ideal = max(ideal, 155.0)
         side = 1 if math.sin(t * 1.05 + self.phase + 0.55 * math.sin(t * 0.7)) >= 0 else -1
         if arena is not None and "lightning" not in kinds:
             lx, ly = -axis[1], axis[0]
-            cl_pos = arena.ground_clearance(pos[0] + lx * 8.0, pos[1] + ly * 8.0)
-            cl_neg = arena.ground_clearance(pos[0] - lx * 8.0, pos[1] - ly * 8.0)
-            if side == 1 and cl_pos > 16.0 and 2.8 <= cl_neg <= 11.0 and arena.open_step(pos, (-lx, -ly), 6.0):
+            cl_pos = min(arena.ground_clearance(pos[0] + lx * 8.0, pos[1] + ly * 8.0),
+                         arena.ground_clearance(pos[0] + lx * 15.0, pos[1] + ly * 15.0))
+            cl_neg = min(arena.ground_clearance(pos[0] - lx * 8.0, pos[1] - ly * 8.0),
+                         arena.ground_clearance(pos[0] - lx * 15.0, pos[1] - ly * 15.0))
+            if side == 1 and cl_pos > 15.0 and 2.5 <= cl_neg <= 11.5 and arena.open_step(pos, (-lx, -ly), 6.0):
                 side = -1
-            elif side == -1 and cl_neg > 16.0 and 2.8 <= cl_pos <= 11.0 and arena.open_step(pos, (lx, ly), 6.0):
+            elif side == -1 and cl_neg > 15.0 and 2.5 <= cl_pos <= 11.5 and arena.open_step(pos, (lx, ly), 6.0):
                 side = 1
         radial = max(-1.65, min(1.35, (distance_now - ideal) / 24))
         return unit(radial * axis[0] - side * axis[1], radial * axis[1] + side * axis[0])
@@ -127,7 +134,7 @@ class Footwork:
             self.jet_until = t + 0.58
 
         active_jet = t < self.jet_until
-        mobile = mode in ("duel", "retreat", "rotate", "finish") or (moving and target_dist > 16)
+        mobile = mode in ("duel", "retreat", "rotate", "finish", "peek") or (moving and target_dist > 16)
         reserve = 24 if mode == "duel" else 13
         if climbing:
             reserve = min(me["max_energy"] * 0.93, max(39, 15 + (altitude - pos[2]) * 2.1))
