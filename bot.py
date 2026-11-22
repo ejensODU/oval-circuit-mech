@@ -320,9 +320,20 @@ class Bot:
                     continue
                 benefit = (9. if not secondary else 1.) + 2.3*gain
             elif group=='drop':
+                # A rival anywhere in the landed ring freezes our capture, even
+                # when the server still reports us as holder with banked time.
+                if item['lands_in'] <= 0 and any(
+                        a['kind'] == 'mech' and a.get('hp', 1) > 0 and
+                        abs(a['pos'][2] - q[2]) <= 4. and distance(a['pos'], q) <= item['radius']
+                        for a in obs['mechs']):
+                    continue
                 if owner not in (None, me['id']) and item['progress']+eta >= item['capture_s']+.3:
                     continue
                 cap = item['capture_s'] - (item['progress'] if owner == me['id'] else 0.)
+                visible = [e for e in contacts if e['_open']]
+                if (cap > 1.2 and len(visible) >= 2 and
+                        any(distance(p, e['pos']) < 65. for e in visible)):
+                    continue
                 eta = max(item['lands_in'], eta)+max(0.,cap)
                 benefit = 16.*marginal + 65.*(1-me['hp']/me['max_hp'])
                 if owner == me['id']:
@@ -441,9 +452,7 @@ class Bot:
             value, group, obj = resource
             d = distance(p,obj['pos'])
             if group == 'drop':
-                rem_cap = obj['capture_s'] - (obj['progress'] if obj.get('holder') == me['id'] else 0.)
-                drop_ambush = (len(visible) >= 2 and min(distance(p, e['pos']) for e in visible) < 65. and rem_cap > 1.2)
-                if not drop_ambush and (obj.get('holder') == me['id'] or
+                if (obj.get('holder') == me['id'] or
                         (value > 1.7 and (not visible or fraction < .78 or d < obj['radius']+5.))):
                     return self.follow(resource,obs)
             # A second arm on our route pays for itself in a single duel.
@@ -509,14 +518,16 @@ class Bot:
         t = obs['t']
         d = math.dist(obs['self']['pos'], plan.goal) if len(plan.goal) == 3 else distance(obs['self']['pos'], plan.goal)
         hitting = any(e['type']=='hit' and e['target']==plan.resource for e in obs['events'])
-        capturing = plan.mode=='capture' and any(d['id']==plan.resource and
-                       (d.get('holder') == obs['self']['id'] or d['lands_in']>0) for d in obs.get('drops',()))
+        drop = None
+        if plan.mode == 'capture':
+            drop = next((item for item in obs.get('drops', ()) if item['id'] == plan.resource), None)
+        progress = drop['progress'] if drop and drop['holder'] == obs['self']['id'] else 0.
         if self.resource != plan.resource or self.resource_progress is None:
-            self.resource_progress = (t,d)
+            self.resource_progress = (t,d,progress)
         elif plan.resource is not None:
-            since, best = self.resource_progress
-            if best-d > 3. or hitting or capturing:
-                self.resource_progress = (t,d)
+            since, best, previous = self.resource_progress
+            if best-d > 3. or hitting or progress > previous or (drop and drop['lands_in'] > 0):
+                self.resource_progress = (t,d,progress)
             elif t-since > (12. if plan.mode=='capture' else 7.):
                 self.blocked_until[plan.resource] = t+12.
                 self.resource_progress = None

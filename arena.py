@@ -1,6 +1,7 @@
 """Campus geometry and ground navigation, rebuilt from each match's mounted map."""
 
 from array import array
+from collections import deque
 from heapq import heappop, heappush
 import json
 import math
@@ -47,7 +48,6 @@ class Arena:
             self._rasterize(prism)
 
         self.base_height = self.height
-        self.base_margin = self._clearances(self.height)
         cube_rules = hello["config"].get("cubes", {})
         self.size_per_cube = cube_rules.get("size_per_cube", 0.05)
         self.muzzle = mech.get("muzzle_height", self.height * 0.78)
@@ -55,8 +55,7 @@ class Arena:
         # Precompute two conservative headroom tiers while keeping the observed
         # horizontal radius exact. Geometry keeps growing above the HP stat cap.
         self.tall_height = self.height * 1.5
-        self.tall_margin = self._clearances(self.tall_height)
-        self.giant_margin = self._clearances(math.inf)
+        self.base_margin, self.tall_margin, self.giant_margin = self._clearances()
         self.margin = self.base_margin
         # Chamfer units: 3 axial / 4 diagonal. Round up to allow for raster error.
         self.min_margin = max(1, math.ceil((self.body + 0.25) * self.inv * 3))
@@ -101,7 +100,7 @@ class Arena:
                     if base < base_field[p]:
                         base_field[p] = base
 
-    def _clearances(self, height):
+    def _clearances(self):
         nx, ny = self.nx, self.ny
         b = self.bounds
         left = max(1, math.ceil((b["minX"] - self.ox) * self.inv))
@@ -111,18 +110,28 @@ class Arena:
         margin = bytearray(nx * ny)
         heights = self.heights
         ground_scale = 100 * self.scale
-        head = 100 * height
+        head = 100 * self.base_height
+        tall_head = 100 * self.tall_height
+        tall_blocked, giant_blocked = [], []
         step = 100 * self.max_step
-        steep = self.slope * self.step / self.scale
+        slope_limit = 4 * (self.slope * self.step / self.scale) ** 2
         for j in range(bottom, top + 1):
             for p in range(j * nx + left, j * nx + right + 1):
                 z = heights[p] * ground_scale
-                if self.ceiling[p] > z + step and self.floor[p] < z + head:
+                overhead = math.inf
+                if self.ceiling[p] > z + step:
+                    overhead = self.floor[p]
+                if self.bridge_top[p] > z + step:
+                    overhead = min(overhead, self.bridge_base[p])
+                if overhead < z + head:
                     continue
-                if self.bridge_top[p] > z + step and self.bridge_base[p] < z + head:
+                dx, dy = heights[p-1] - heights[p+1], heights[p-nx] - heights[p+nx]
+                if dx*dx + dy*dy > slope_limit:
                     continue
-                if abs(heights[p-1] - heights[p+1]) ** 2 + abs(heights[p-nx] - heights[p+nx]) ** 2 > 4 * steep ** 2:
-                    continue
+                if overhead < z + tall_head:
+                    tall_blocked.append(p)
+                elif overhead < math.inf:
+                    giant_blocked.append(p)
                 margin[p] = min(240, margin[p-1]+3, margin[p-nx]+3,
                                 margin[p-nx-1]+4, margin[p-nx+1]+4)
         for j in range(top, bottom - 1, -1):
@@ -130,7 +139,31 @@ class Arena:
                 if margin[p] > 3:
                     margin[p] = min(margin[p], margin[p+1]+3, margin[p+nx]+3,
                                     margin[p+nx-1]+4, margin[p+nx+1]+4)
-        return margin
+        tall = self._add_obstacles(margin, tall_blocked)
+        return margin, tall, self._add_obstacles(tall, giant_blocked)
+
+    def _add_obstacles(self, margin, blocked):
+        # A taller mech adds ground obstacles. Update the same 3/4 chamfer
+        # distances only where a newly blocked pixel is closer.
+        # The route planner identifies tiers by their array identity.
+        result = bytearray(margin)
+        if not blocked:
+            return result
+        for p in blocked:
+            result[p] = 0
+        queue = deque(blocked)
+        nx = self.nx
+        adjacent = ((-1, 3), (1, 3), (-nx, 3), (nx, 3),
+                    (-nx-1, 4), (-nx+1, 4), (nx-1, 4), (nx+1, 4))
+        while queue:
+            p = queue.popleft()
+            distance = result[p]
+            for offset, cost in adjacent:
+                q = p + offset
+                if distance + cost < result[q]:
+                    result[q] = distance + cost
+                    queue.append(q)
+        return result
 
     def _pixel(self, x, y):
         i = int((x - self.ox) * self.inv + 0.5)
