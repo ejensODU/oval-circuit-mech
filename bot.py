@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import mechfight
 from arena import Arena
 from combat import Combat
+from practice_bot import PracticeBot
 from tactics import Tactics, ring_at
 
 
@@ -81,6 +82,7 @@ class Bot:
     def __init__(self, hello):
         self.cfg = hello['config']
         self.arena = Arena(hello)
+        self.practice = PracticeBot(hello, self.arena)
         self.combat = Combat(hello, self.arena)
         self.feet = Tactics(self.arena, self.cfg)
         self.read = MatchRead(self.cfg)
@@ -564,6 +566,10 @@ class Bot:
         self.arena.set_body(me['stats'])
         rivals = [a for a in obs['mechs'] if a['kind']=='mech' and a.get('hp',1)>0]
         self.remember(obs,rivals)
+        if not self.is_ffa:
+            action = self.practice.act(obs)
+            self.mode = self.practice.mode
+            return action
         contacts = self.contacts(obs,rivals)
         resources = self.resources(obs,contacts)
         plan = self.plan(obs,contacts,resources)
