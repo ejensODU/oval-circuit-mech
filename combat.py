@@ -93,8 +93,16 @@ class Combat:
                         + 14 * (now - self.attacks.get(obj["id"], -100) < 3))
                 if obj.get("charging"):
                     rate += 14
-                if "laser" in weapons and "mortar" in obj.get("weapons", ()):
-                    rate += 11
+                if "laser" in weapons:
+                    lw_sel = weapons["laser"]
+                    if "mortar" in obj.get("weapons", ()):
+                        rate += 35
+                    if lw_sel.get("charge", 0) > 0 or lw_sel.get("cooldown", 0) < 0.35:
+                        mult_sel = 1 + self.config["cubes"]["damage_per_cube"] * min(me["cubes"], self.config["cubes"]["stat_cap"])
+                        if "mortar" in obj.get("weapons", ()):
+                            mult_sel *= 1 + lw_sel["stats"]["cookoff"]
+                        if hp <= lw_sel["stats"]["damage"] * mult_sel:
+                            rate += 85
                 if d > reach:
                     rate -= 60
             else:
@@ -116,6 +124,8 @@ class Combat:
         for _, _, obj in candidates[:5]:
             height = self._visible_height(arena, origin, obj, now)
             if height is not None:
+                if obj.get("kind") != "mech" and sheltered is not None and math.dist(sheltered["pos"], me["pos"]) <= 160.0:
+                    break
                 return obj, height, True
             if sheltered is None and obj.get("kind") == "mech":
                 sheltered = obj

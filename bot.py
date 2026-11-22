@@ -333,9 +333,11 @@ class Bot:
             drop = loot[1]
             radius_cap = drop["radius"]
             capturing = distance(pos, drop["pos"]) < radius_cap and drop["lands_in"] < 1
-            if (capturing or hp < 0.72) and closest > (15 if capturing else 42) and value > 0.65:
+            rem_cap = drop["capture_s"] - (drop["progress"] if drop.get("holder") == me["id"] else 0.0)
+            drop_ambush = (len(threats) >= 2 and closest < 65.0 and rem_cap > 1.3)
+            if not drop_ambush and (capturing or hp < 0.72) and closest > (15 if capturing else 42) and value > 0.65:
                 self.remember_goal(loot, obs)
-                return "capture", drop["pos"], None, radius_cap * 0.47, self.recovering
+                return "capture", drop["pos"], None, radius_cap * 0.47, self.recovering and not threats
         under_fire = t - self.last_damage < 2.8
         outnumbered = sum(distance(pos, m["pos"]) < 130 for m in threats) >= 2
         aimed = sum(math.cos(m["aim"][0] - math.atan2(pos[1] - m["pos"][1], pos[0] - m["pos"][0])) > 0.92 for m in threats)
@@ -369,7 +371,7 @@ class Bot:
         if attackers and hurt_or_focused and zone["radius"] > 16:
             escape = self.protect(pos, attackers, zone, t)
             if escape is not None:
-                return "retreat", escape, None, 1.0, trading or (self.recovering and not threats)
+                return "retreat", escape, None, 0.0 if threats else 1.0, trading or (self.recovering and not threats)
             if outnumbered or not known:
                 dx, dy = unit(pos[0] - attackers[0]["pos"][0], pos[1] - attackers[0]["pos"][1])
                 escape = inside_goal((pos[0]+35*dx, pos[1]+35*dy), center, radius*0.92)
