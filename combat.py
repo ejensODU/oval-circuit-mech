@@ -1,327 +1,257 @@
-"""Target selection and trigger control for the Mech Royale game protocol."""
+"""Fire control for a single selected arena actor and two shared-aim slots."""
 import math
 
 
-def angle_delta(a, b):
+def clamp(value, lo, hi):
+    return min(hi, max(lo, value))
+
+
+def yaw_delta(a, b):
     return (a - b + math.pi) % math.tau - math.pi
 
 
-def bearing(a, b):
-    dx, dy, dz = (b[i] - a[i] for i in range(3))
-    return math.atan2(dy, dx), math.atan2(dz, math.hypot(dx, dy))
+def angles(start, end):
+    x, y, z = (b - a for a, b in zip(start, end))
+    return math.atan2(y, x), math.atan2(z, math.hypot(x, y))
 
 
 class Combat:
-    def __init__(self, hello):
-        self.config = hello["config"]
-        self.tick_s = 1 / self.config["match"]["tick_hz"]
-        self.target = None
-        self.attacks = {}
-        self.last_bearing = None
-        self.bearing_until = -1
-        self.scan_sign = 1 if hello["seed"] % 2 else -1
-        self.sight = {}
-        self.blocked_since = {}
-        self.arc = {}
-        self.light_hold = False
-        self.rear_bearing = None
-        self.rear_until = -1.0
+    def __init__(self, hello, arena=None):
+        self.cfg = hello["config"]
+        match = self.cfg["match"]
+        self.tick = 1 / match["tick_hz"]
+        self.step = self.tick * match["decide_every"]
+        self.arena = arena
+        self.last_laser_line = -math.inf
+        self.last_enemy_line = -math.inf
+        self.refilling_arc = False
+        self.lens_effects = {
+            upgrade["id"]: tuple(e for e in upgrade.get("effects", ())
+                                 if e["path"] == "weapons.laser.damage")
+            for upgrade in self.cfg.get("upgrades", ())
+            if any(e["path"] == "weapons.laser.damage" for e in upgrade.get("effects", ()))
+        }
 
-    def _observe(self, obs):
-        t = obs["t"]
-        for e in obs["events"]:
-            if e["type"] == "damaged" and e.get("bearing") is not None:
-                self.last_bearing = e["bearing"]
-                self.bearing_until = t + 1.1
-                self.attacks[e.get("by")] = t
-                if e.get("rear"):
-                    self.rear_bearing = e["bearing"]
-                    self.rear_until = t + 0.90
-        if self.bearing_until < t:
-            cues = [s for s in obs["sounds"] if s["kind"] in
-                    ("laser_charge", "gun", "laser", "mortar", "boost", "step", "lightning")]
-            if cues:
-                cue = max(cues, key=lambda s: ({"near": 3, "mid": 2, "far": 0}.get(s["dist"], 0)
-                                               + (s["kind"] == "laser_charge"), -s["age"]))
-                self.last_bearing = cue["bearing"]
-                self.bearing_until = t + (0.45 if cue["dist"] != "far" else 0.2)
+    def body(self, actor):
+        kind = actor.get("kind", "crate")
+        section = {"mech": "mech", "crate": "crates"}.get(kind, "npc")
+        size = 1.0
+        if kind == "mech":
+            size += actor.get("cubes", 0) * self.cfg["cubes"]["size_per_cube"]
+        body = self.cfg[section]
+        return size * body["height"], size * body["radius"]
 
-    def _body(self, target):
-        kind = target.get("kind", "crate")
-        section = self.config["mech" if kind == "mech" else "npc" if kind == "npc" else "crates"]
-        scale = 1 + self.config["cubes"]["size_per_cube"] * target.get("cubes", 0) if kind == "mech" else 1
-        return scale * section["height"], scale * section["radius"]
+    def clear(self, start, end):
+        return self.arena is None or self.arena.clear(start, end)
 
-    def _visible_height(self, arena, origin, target, now):
-        pos = target["pos"]
-        height, _ = self._body(target)
-        cached = self.sight.get(target["id"])
-        if cached and now - cached[0] < 0.18 and math.dist(origin, cached[1]) < 1.4 and math.dist(pos, cached[2]) < 1.4:
-            return cached[3]
-        chosen = None
-        for frac in (0.52, 0.85, 0.22):
-            if arena.clear(origin, (pos[0], pos[1], pos[2] + height * frac)):
-                chosen = height * frac
-                break
-        if chosen is None:
-            self.blocked_since.setdefault(target["id"], now)
-        else:
-            self.blocked_since.pop(target["id"], None)
-        self.sight[target["id"]] = now, origin, tuple(pos), chosen
-        return chosen
+    def point(self, actor, height, dt):
+        x, y, z = actor["pos"]
+        vx, vy, vz = actor.get("vel", (0, 0, 0))
+        # A direction seen now conveys little information several seconds out.
+        # All gun leads use unattenuated horizontal velocity. Shells approach
+        # a bounded displacement as the uncertainty in a long lob increases.
+        travel = dt if dt <= 1.0 else 1.0 - math.expm1(1.0 - dt)
+        x, y = x + travel * vx, y + travel * vy
+        if abs(vz) > 0.5:
+            vertical_dt = min(dt, 0.65)
+            z += vz * vertical_dt - 0.5 * self.cfg["mech"]["gravity"] * vertical_dt**2
+            if self.arena:
+                z = max(z, self.arena.ground(x, y))
+        return x, y, z + height
 
-    def _select(self, obs, arena, origin, focus, weapons, quiet):
-        me, now = obs["self"], obs["t"]
-        last = self.target["id"] if self.target else None
-        focus_id = focus.get("id") if focus else None
-        candidates = []
-        reach = max((w["stats"].get("range", w["stats"].get("speed", 0)**2 /
-                                    max(1, w["stats"].get("gravity", 1))) for w in weapons.values()), default=0)
-        for obj in (*obs["mechs"], *obs["crates"]):
-            pos = obj["pos"]
-            kind = obj.get("kind", "crate")
-            d = math.dist(pos, me["pos"])
-            if d > reach + 12 and (kind != "mech" or d > reach + 70):
-                continue
-            yaw = math.atan2(pos[1] - origin[1], pos[0] - origin[0])
-            if kind == "mech":
-                hp = obj.get("hp", self.config["mech"]["hp"])
-                enemy_aim = obj.get("aim", (0, 0))[0]
-                looking = abs(angle_delta(enemy_aim, yaw + math.pi)) < 0.35
-                rate = (110 - 0.28 * d + 32 * max(0, 1 - hp / self.config["mech"]["hp"])
-                        + 27 * (hp < 265) + 16 * (d < 48) + 13 * looking
-                        + 14 * (now - self.attacks.get(obj["id"], -100) < 3))
-                if obj.get("charging"):
-                    rate += 14
-                if "laser" in weapons:
-                    lw_sel = weapons["laser"]
-                    if "mortar" in obj.get("weapons", ()):
-                        rate += 35
-                    if lw_sel.get("charge", 0) > 0 or lw_sel.get("cooldown", 0) < 0.35:
-                        mult_sel = 1 + self.config["cubes"]["damage_per_cube"] * min(me["cubes"], self.config["cubes"]["stat_cap"])
-                        if "mortar" in obj.get("weapons", ()):
-                            mult_sel *= 1 + lw_sel["stats"]["cookoff"]
-                        if hp <= lw_sel["stats"]["damage"] * mult_sel:
-                            rate += 85
-                if d > reach:
-                    rate -= 60
-            else:
-                if quiet or d > (110 if focus_id == obj["id"] else 70):
-                    continue
-                rate = 26 - 0.38 * d + 8 * (kind == "npc" and d < self.config["npc"]["aggro_range"])
-                if focus_id == obj["id"]:
-                    rate += 28
-            rate += 9 * (last == obj["id"]) + 7 * (focus_id == obj["id"])
-            rate -= 3 * abs(angle_delta(yaw, me["aim"][0]))
-            cached = self.sight.get(obj["id"])
-            if cached and cached[3] is None and now - cached[0] < 0.33:
-                rate -= 32
-            candidates.append((rate, obj["id"], obj))
-        candidates.sort(key=lambda x: -x[0])
-        # LOS checks are the expensive part. Limit the work even if everyone
-        # converges behind a wall in the last circle.
-        sheltered = None
-        for _, _, obj in candidates[:5]:
-            height = self._visible_height(arena, origin, obj, now)
-            if height is not None:
-                if obj.get("kind") != "mech" and sheltered is not None and math.dist(sheltered["pos"], me["pos"]) <= 160.0:
-                    break
-                return obj, height, True
-            if sheltered is None and obj.get("kind") == "mech":
-                sheltered = obj
-        if sheltered is not None and (now - self.blocked_since[sheltered["id"]] < 0.65 or
-                                      (not quiet and "mortar" in weapons and weapons["mortar"]["cooldown"] < 0.24)):
-            return sheltered, self._body(sheltered)[0] * 0.5, False
-        return None, 0, False
+    def muzzle(self, me, height, dt):
+        p = me["pos"]
+        v = me["vel"]
+        return p[0]+dt*v[0], p[1]+dt*v[1], p[2]+dt*v[2]+height
 
-    def _point(self, obj, height, flight):
-        x, y, z = obj["pos"]
-        vx, vy, vz = obj.get("vel", (0, 0, 0))
-        # Ground movement extrapolates well over a bullet's flight. On long
-        # shell flights the observed heading becomes progressively less useful.
-        lead = min(flight, 1.05) + max(0, flight - 1.05) * 0.52
-        zlead = min(0.53, flight)
-        return x + vx * lead, y + vy * lead, z + height + vz * zlead
-
-    def _gun_aim(self, origin, obj, height, speed, barrel):
-        flight = 0
-        for _ in range(3):
-            point = self._point(obj, height, flight)
-            flight = max(0, math.dist(point, origin) - barrel) / speed + self.tick_s * 0.35
-        return bearing(origin, self._point(obj, height, flight))
-
-    def _mortar_aim(self, arena, me, target, weapon, now, visible):
+    def gun_line(self, me, target, offset, weapon, barrel):
         stats = weapon["stats"]
-        ox, oy, feet = me["pos"]
-        oz = feet + me["stats"]["height"] + 0.5
-        speed, gravity = stats["speed"], stats["gravity"]
-        raw = target["pos"]
-        if math.dist(raw, me["pos"]) < stats["splash_radius"] * 1.65:
+        delay = clamp(weapon.get("cooldown", 0), self.tick, self.step)
+        muzzle = self.muzzle(me, me["stats"]["muzzle_height"], delay)
+        flight = math.dist(muzzle, self.point(target, offset, delay)) / stats["speed"]
+        # Fixed point contraction is bounded by target speed / shot speed.
+        for _ in range(3):
+            hit = self.point(target, offset, delay + flight)
+            flight = max(0.0, math.dist(muzzle, hit) - barrel) / stats["speed"]
+        if flight * stats["speed"] > stats["range"] or not self.clear(muzzle, hit):
             return None
-        cached = self.arc.get(target["id"])
-        if cached and now - cached[0] < 0.15 and math.dist(me["pos"], cached[1]) < 1.3 and math.dist(raw, cached[2]) < 1.4:
-            return cached[3]
-        result = None
-        height = self._body(target)[0] * 0.37
-        flight = max(0.01, (math.dist(me["pos"], raw) - 3) / speed)
-        for high in ([False] if visible else [False, True]):
-            valid = True
-            for _ in range(4):
-                tx, ty, tz = self._point(target, height, flight)
-                dx, dy, dz = tx - ox, ty - oy, tz - oz
-                distance = math.hypot(dx, dy)
-                if distance < 1:
-                    valid = False
-                    break
-                # Start the shell a barrel-length along the launch direction.
-                # First solve the tangent for a conservative three-metre
-                # shorter shot; then refine that offset at the computed pitch.
-                pitch_guess = math.atan2(dz, distance) if _ == 0 else pitch
-                barrel = me["stats"]["radius"] + 0.5
-                run = max(0.5, distance - barrel * math.cos(pitch_guess))
-                rise = dz - barrel * math.sin(pitch_guess)
-                det = speed**4 - gravity * (gravity * run**2 + 2 * rise * speed**2)
-                if det < 0:
-                    valid = False
-                    break
-                root = math.sqrt(det)
-                pitch = math.atan2(speed**2 + (root if high else -root), gravity * run)
-                flight = run / max(1, speed * math.cos(pitch))
-            if not valid or not me["stats"]["min_pitch"] <= pitch <= me["stats"]["max_pitch"] or flight > stats["ttl"]:
-                continue
-            yaw = math.atan2(dy, dx)
-            direction = math.cos(pitch) * math.cos(yaw), math.cos(pitch) * math.sin(yaw), math.sin(pitch)
-            start = (ox, oy, oz)
-            barrel = me["stats"]["radius"] + 0.5
-            # Use short chords near takeoff/impact so a parapet between the
-            # muzzle and the moving target can invalidate the shot.
-            segments = max(3, min(10, math.ceil(flight / 0.37)))
-            for i in range(1, segments + 1):
-                dt = flight * i / segments
-                path = barrel + speed * dt
-                end = (ox + path * direction[0], oy + path * direction[1],
-                       oz + path * direction[2] - 0.5 * gravity * dt**2)
-                if not arena.clear(start, end):
-                    break
-                start = end
-            else:
-                result = yaw, pitch
-                break
-        self.arc[target["id"]] = now, tuple(me["pos"]), tuple(raw), result
-        return result
+        return angles(muzzle, hit)
 
-    def _aligned(self, wish, actual, command, me, radius, height, distance):
-        if wish is None:
+    def shell_line(self, me, target, height, weapon, barrel):
+        stats = weapon["stats"]
+        body = me["stats"]
+        speed, grav = stats["speed"], stats["gravity"]
+        delay = clamp(weapon.get("cooldown", 0), self.tick, self.step)
+        start = self.muzzle(me, body["height"] + 0.5, delay)
+        dist = math.dist(target["pos"], me["pos"])
+        if dist < stats["splash_radius"] + body["radius"] + barrel:
+            return None
+        for high in (False, True):
+            # Refine flight time, target motion and the displaced shot origin.
+            flight = min(stats["ttl"], 1.7 * speed / grav if high else dist / speed)
+            pitch = 1.1 if high else 0.0
+            solution = self._arc(start, target, height, stats, body, barrel, delay, high, flight, pitch)
+            if solution:
+                return solution
+        return None
+
+    def _arc(self, start, target, height, stats, body, barrel, delay, high, flight, pitch):
+        speed, grav = stats["speed"], stats["gravity"]
+        for _ in range(6):
+            hit = self.point(target, 0.32 * height, flight + delay)
+            dx, dy, dz = (b - a for a, b in zip(start, hit))
+            run = math.hypot(dx, dy) - barrel * math.cos(pitch)
+            rise = dz - barrel * math.sin(pitch)
+            disc = speed**4 - grav * (grav * run**2 + 2 * rise * speed**2)
+            if run < 0.2 or disc < 0:
+                return None
+            root = math.sqrt(disc)
+            pitch = math.atan2(speed**2 + (root if high else -root), grav * run)
+            flight = run / (speed * math.cos(pitch))
+        if not body["min_pitch"] <= pitch <= body["max_pitch"] or flight > stats["ttl"]:
+            return None
+        yaw = math.atan2(dy, dx)
+        ray = math.cos(yaw)*math.cos(pitch), math.sin(yaw)*math.cos(pitch), math.sin(pitch)
+        segments = max(3, math.ceil(flight / 0.38))
+        last = start
+        for i in range(1, segments+1):
+            t = i * flight / segments
+            path = barrel + speed * t
+            end = (start[0] + path*ray[0], start[1] + path*ray[1],
+                   start[2] + path*ray[2] - grav*t*t*0.5)
+            if not self.clear(last, end):
+                return None
+            last = end
+        return yaw, pitch
+
+    def charge_needed(self, me, target, laser):
+        stats = laser["stats"]
+        cubes = self.cfg["cubes"]
+        factor = 1 + cubes["damage_per_cube"] * min(me.get("cubes", 0), cubes["stat_cap"])
+        damage = stats["damage"]
+        if factor != 1:
+            # Anchor the two possible wire representations to the configured
+            # laser and this mech's upgrades. Apply cube scaling exactly once.
+            lens_damage = self.cfg["weapons"]["laser"]["damage"]
+            for upgrade in me.get("upgrades", ()):
+                for effect in self.lens_effects.get(upgrade, ()):
+                    lens_damage = lens_damage * effect.get("mul", 1) + effect.get("add", 0)
+            if abs(damage - lens_damage) <= abs(damage - lens_damage * factor):
+                damage *= factor
+        if "mortar" in target.get("weapons", ()):
+            damage *= 1 + stats["cookoff"]
+        # Allow a margin for hidden armor on mechs. Crate HP and armor are exact.
+        hp = target.get("hp", math.inf)
+        if target.get("kind") == "mech":
+            hp *= 1.10
+        fraction = (hp / damage - stats["min_frac"]) / max(0.001, 1 - stats["min_frac"])
+        return clamp(stats["charge"] * fraction, stats["min_charge"], stats["charge"])
+
+    def aligned(self, actual, command, line, me, width, height, dist, when):
+        if line is None:
             return False
-        stats = me["stats"]
-        yaw = actual[0] + max(-stats["turn_rate"] * self.tick_s,
-                              min(stats["turn_rate"] * self.tick_s, angle_delta(command[0], actual[0])))
-        pitch = actual[1] + max(-stats["pitch_rate"] * self.tick_s,
-                                min(stats["pitch_rate"] * self.tick_s, command[1] - actual[1]))
-        return (abs(angle_delta(wish[0], yaw)) < math.atan2(radius, max(1, distance)) + 0.003
-                and abs(wish[1] - pitch) < math.atan2(height, max(1, distance)) + 0.003)
+        st = me["stats"]
+        yaw = actual[0] + clamp(yaw_delta(command[0], actual[0]), -st["turn_rate"]*when, st["turn_rate"]*when)
+        pitch = actual[1] + clamp(command[1] - actual[1], -st["pitch_rate"]*when, st["pitch_rate"]*when)
+        return (abs(yaw_delta(yaw, line[0])) <= math.atan2(width, dist)
+                and abs(pitch - line[1]) <= math.atan2(height, dist))
 
-    def _scan_yaw(self, now, actual):
-        if self.bearing_until < now:
-            return angle_delta(actual + self.scan_sign * 0.50, 0)
-        # Search across a bearing, especially when repeated shots come from
-        # behind a building. Keep the source in the armored front hemisphere.
-        return angle_delta(self.last_bearing + 0.6 * math.sin(now * 1.7), 0)
-
-    def act(self, obs, arena, focus=None, quiet=False):
-        self._observe(obs)
+    def engage(self, obs, target, action):
+        """Mutate aim and triggers. The caller supplies the search aim while idle."""
         me, now = obs["self"], obs["t"]
-        sx, sy, sz = me["pos"]
-        actual = me["aim"]
-        origin = (sx, sy, sz + me["stats"]["muzzle_height"])
         weapons = {w["kind"]: w for w in me["weapons"] if w}
-        obj, height, visible = self._select(obs, arena, origin, focus, weapons, quiet)
-        self.target = obj
+        gun, laser = weapons.get("gun"), weapons.get("laser")
         trigger = [False, False]
-        gun = weapons.get("gun")
-        if obj is None:
-            return {"aim": [self._scan_yaw(now, actual[0]), 0.0], "fire": trigger,
-                    "reload": bool(gun and gun["ammo"] <= gun["stats"]["mag"] - 2 and gun["reload"] == 0)}
-        distance = math.dist(me["pos"], obj["pos"])
-        direct = bearing(origin, self._point(obj, height, self.tick_s * 0.35))
-        is_mech = obj.get("kind") == "mech"
-        urgent = (is_mech and (distance < 27 or
-                  (obj.get("hp", 10000) < 160 and distance < 100) or
-                  (distance < 75 and now - self.attacks.get(obj["id"], -100) < 1.2)))
-        may_fire = not quiet or urgent
-        wishes = {"laser": direct, "lightning": direct}
-        gun_in_range = bool(gun and distance <= gun["stats"]["range"] + 2)
-        if gun and visible:
-            wishes["gun"] = self._gun_aim(origin, obj, height, gun["stats"]["speed"], me["stats"]["radius"] + 0.5)
+        action["fire"] = trigger
+        if gun and gun.get("reload", 0) <= 0:
+            missing = gun["stats"]["mag"] - gun.get("ammo", gun["stats"]["mag"])
+            action["reload"] = gun.get("ammo") == 0 or (
+                target is None and missing >= (2 if now-self.last_enemy_line > 0.7 else 6))
+        if target is None:
+            if laser and laser.get("charge", 0) > 0:
+                trigger[me["weapons"].index(laser)] = now - self.last_laser_line < 0.85
+            return
+
+        body = me["stats"]
+        barrel = body["radius"] + 0.5
+        origin = self.muzzle(me, body["muzzle_height"], self.tick)
+        height, radius = self.body(target)
+        # Tracking persists for five seconds, even behind walls. Test the
+        # muzzle-to-body segment and try another exposed band at a roof lip.
+        offset = height * 0.53
+        aim_point = self.point(target, offset, self.tick)
+        exposed = self.clear(origin, aim_point)
+        if not exposed:
+            for fraction in (0.88, 0.22):
+                candidate = self.point(target, height * fraction, self.tick)
+                if self.clear(origin, candidate):
+                    offset, aim_point, exposed = height * fraction, candidate, True
+                    break
+        direct = angles(origin, aim_point)
+        dist = max(0.1, math.dist(origin, aim_point))
+        if exposed and target.get("kind") == "mech":
+            self.last_enemy_line = now
+
+        gun_aim = None
+        if gun and exposed and gun.get("reload", 0) <= self.step and gun.get("ammo", 1) > 0:
+            gun_aim = self.gun_line(me, target, offset, gun, barrel)
+
+        # Each slot votes for a torso solution only near its own firing window.
+        # The gun can keep firing during the laser wind-up. A charged release
+        # owns the torso for a single decision, then hands it back to gun lead.
+        command = gun_aim or direct
         mortar = weapons.get("mortar")
-        if mortar and mortar["cooldown"] < 0.24 and may_fire:
-            shell = self._mortar_aim(arena, me, obj, mortar, now, visible)
-            if shell is not None:
-                wishes["mortar"] = shell
-        laser = weapons.get("laser")
-        laser_in_range = bool(laser and distance <= laser["stats"]["range"] + 2)
-        laser_release = False
-        prealign = False
-        if laser and laser_in_range and visible:
-            charge = laser.get("charge", 0)
-            stats = laser["stats"]
-            multiplier = 1 + self.config["cubes"]["damage_per_cube"] * min(me["cubes"], self.config["cubes"]["stat_cap"])
-            if "mortar" in obj.get("weapons", ()):
-                multiplier *= 1 + stats["cookoff"]
-            # Avoid waiting for full charge when a partial beam will finish.
-            # Health is public only on some configurations, and the target
-            # may have armor, so leave a small margin.
-            hp = obj.get("hp", math.inf) * 1.12
-            desired = (hp / (stats["damage"] * multiplier) - stats["min_frac"]) / max(0.01, 1 - stats["min_frac"])
-            goal_charge = max(stats["min_charge"], min(1, desired) * stats["charge"])
-            laser_release = charge > 0 and charge >= goal_charge - self.tick_s * 0.45
-            prealign = charge > 0 and charge >= goal_charge - 0.1225
-        command = direct
-        if may_fire:
-            if laser_release or prealign:
-                command = direct
-            elif "mortar" in wishes:
-                command = wishes["mortar"]
-            elif gun_in_range and visible and gun["reload"] < 0.15:
-                command = wishes["gun"]
-        if not visible and "mortar" not in wishes and now - self.blocked_since.get(obj["id"], now) >= 0.65:
-            command = (self._scan_yaw(now, actual[0]), 0)
-        # Non-blocking rear-armor face: ONLY when we cannot fire (not visible, OR gun reloading & laser not charging/ready).
-        if self.rear_bearing is not None and now < self.rear_until:
-            gun_dead = (not gun_in_range or gun["reload"] > 0.35 or gun["ammo"] <= 0)
-            laser_busy = bool(laser and laser_in_range and visible and (laser.get("charge", 0) > 0 or laser.get("cooldown", 0) < 0.25))
-            light_busy = bool("lightning" in weapons and visible and distance < weapons["lightning"]["stats"]["range"] + 1)
-            if (not visible and "mortar" not in wishes) or (gun_dead and not laser_busy and not light_busy):
-                command = (self.rear_bearing, 0.0)
-        command = (command[0], min(me["stats"]["max_pitch"], max(me["stats"]["min_pitch"], command[1])))
-        body_height, radius = self._body(obj)
-        for i, w in enumerate(me["weapons"]):
-            if not w or not may_fire:
+        shell = None
+        if mortar and mortar["cooldown"] <= self.step + self.tick:
+            shell = self.shell_line(me, target, height, mortar, barrel)
+            if shell:
+                command = shell
+        beam = False
+        charge = laser.get("charge", 0) if laser else 0
+        release = False
+        if laser:
+            beam = exposed and dist <= laser["stats"]["range"] + barrel
+            if beam:
+                self.last_laser_line = now
+                goal = self.charge_needed(me, target, laser)
+                # Wire seconds may be rounded (e.g. a 0.421875 s upgraded
+                # full charge reported as 0.42). Avoid holding it to timeout.
+                release = charge > 0 and charge + min(0.0051, self.tick*0.25) >= goal
+                if charge > 0 and charge + self.step >= goal - 1e-6:
+                    command = direct
+        action["aim"] = (command[0], clamp(command[1], body["min_pitch"], body["max_pitch"]))
+        actual = me["aim"]
+        # Far shots at the top of a silhouette have less vertical error budget.
+        vertical = max(0.1, min(offset, height - offset))
+        for slot, w in enumerate(me["weapons"]):
+            if not w:
                 continue
             kind, stats = w["kind"], w["stats"]
-            aligned = self._aligned(wishes.get(kind), actual, command, me, radius + 0.30, 0.42 * body_height, distance)
+            delay = clamp(w["cooldown"], self.tick, self.step)
             if kind == "gun":
-                trigger[i] = visible and gun_in_range and aligned and w["reload"] == 0 and w["ammo"] > 0
-            elif kind == "laser" and laser_in_range and visible:
-                # Releasing is irreversible. Confirm the reported torso has
-                # actually reached the beam line after switching off gun lead.
-                on_beam = self._aligned(direct, actual, actual, me, radius, 0.42 * body_height, distance)
-                trigger[i] = not (laser_release and aligned and on_beam)
-            elif kind == "lightning":
-                cost = stats["energy"]
-                mult = 1 + self.config["cubes"]["damage_per_cube"] * min(me["cubes"], self.config["cubes"]["stat_cap"])
-                two_kill = obj.get("hp", 9999) <= 2.0 * stats["damage"] * mult
-                if me["energy"] < cost:
-                    self.light_hold = True
-                if self.light_hold and (me["energy"] >= max(10 * cost, 0.30 * me["max_energy"]) or two_kill):
-                    self.light_hold = False
-                trigger[i] = (not self.light_hold and visible and distance < stats["range"] + 0.3 and
-                              abs(angle_delta(actual[0], direct[0])) < math.radians(stats["cone_deg"]) * 0.85
-                              and me["energy"] >= cost)
+                trigger[slot] = self.aligned(actual, action["aim"], gun_aim, me, radius, vertical, dist, delay)
+            elif kind == "laser":
+                on_target = self.aligned(actual, action["aim"], direct, me, radius*0.90, vertical*0.90, dist, self.tick)
+                trigger[slot] = (beam and not (release and on_target)) or (
+                    charge > 0 and not beam and now - self.last_laser_line < 0.85)
             elif kind == "mortar":
-                trigger[i] = aligned
-        reload = False
-        if gun and gun["reload"] == 0 and gun["ammo"] < gun["stats"]["mag"]:
-            reload = gun["ammo"] <= 0 or (not any(trigger) and
-                ((quiet and not urgent) or not gun_in_range or (not visible and gun["ammo"] <= gun["stats"]["mag"] * 0.68)))
-        return {"aim": list(command), "fire": trigger, "reload": reload}
+                trigger[slot] = self.aligned(actual, action["aim"], shell, me, radius+0.5, height*0.30, dist, delay)
+            elif kind == "lightning":
+                cone = math.radians(stats["cone_deg"])
+                projected = actual[0] + clamp(yaw_delta(action["aim"][0], actual[0]), -body["turn_rate"]*delay, body["turn_rate"]*delay)
+                cost = stats["energy"]
+                energy = me["energy"]
+                # Paying the regeneration delay for each single shot starves
+                # the arc after a long exchange. Bank a burst before resuming.
+                burst = min(me["max_energy"], clamp(0.30*me["max_energy"], 6*cost, 12*cost))
+                if energy < cost:
+                    self.refilling_arc = True
+                elif energy >= burst:
+                    self.refilling_arc = False
+                urgent = target.get("charging", False) or target.get("hp", math.inf) <= stats["damage"]*0.90
+                trigger[slot] = (exposed and dist <= stats["range"] and energy >= cost
+                                 and (not self.refilling_arc or urgent)
+                                 and abs(yaw_delta(projected, direct[0])) <= cone)
+
+        if gun and not exposed and gun.get("reload", 0) == 0 and gun.get("ammo", 0) <= gun["stats"]["mag"] * 0.6:
+            action["reload"] = True

@@ -1,527 +1,600 @@
-"""Oval Circuit, a placement-oriented controller for the Mech Royale arena."""
+"""Relay, a mechfight/1 controller. One encounter plan drives both arms and legs."""
 import math
-import random
+import sys
+from dataclasses import dataclass
 
 import mechfight
 from arena import Arena
 from combat import Combat
-from tactics import Footwork, distance, future_ring, inside_goal, unit
+from tactics import Tactics, ring_at
+
+
+def distance(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def into_disk(p, center, r):
+    f = min(1., max(0., r) / max(.001, distance(p, center)))
+    return center[0] + f * (p[0] - center[0]), center[1] + f * (p[1] - center[1])
+
+
+@dataclass
+class Plan:
+    mode: str
+    goal: tuple | list
+    resource: int | None = None
+
+
+class MatchRead:
+    """Practice is the prior. Switch once multiple independent deaths or combat evidence warrants it."""
+    def __init__(self, config):
+        self.body = config['mech']
+        self.growth = config['cubes']['size_per_cube']
+        self.start_alive = None
+        self.kills = set()
+        self.hp = {}
+        self.rival_hits = set()
+        self.is_ffa = False
+
+    def update(self, obs, rivals):
+        if self.start_alive is None:
+            self.start_alive = obs['alive']
+        t = obs['t']
+        our_hits = set()
+        for e in obs['events']:
+            if e['type'] == 'kill':
+                self.kills.add(e['target'])
+            elif e['type'] == 'hit':
+                our_hits.add(e['target'])
+        if self.is_ffa:
+            return
+        # A rival losing HP alone is ambiguous (drones, storm). Require a rival's
+        # beam segment through that body, recent observed HP loss, and no own hit.
+        for r in rivals:
+            rid, p = r['id'], r['pos']
+            hp = r.get('hp')
+            last_t, old_hp = self.hp.get(rid, (-10., hp))
+            self.hp[rid] = (t, hp)
+            if hp is None or old_hp is None or t-last_t > .3 or hp >= old_hp or rid in our_hits:
+                continue
+            for b in obs.get('beams', ()):
+                if b['by'] in (obs['self']['id'], rid):
+                    continue
+                for a, end in zip(b['path'], b['path'][1:]):
+                    dx, dy = end[0]-a[0], end[1]-a[1]
+                    f = min(1., max(0., ((p[0]-a[0])*dx + (p[1]-a[1])*dy) / max(.001, dx*dx + dy*dy)))
+                    size = 1. + self.growth*r.get('cubes', 0)
+                    if (distance(p, (a[0]+f*dx, a[1]+f*dy)) <= self.body['radius']*size+.5 and
+                            p[2]-1 <= a[2]+f*(end[2]-a[2]) <= p[2]+self.body['height']*size+1):
+                        self.rival_hits.add((b['by'], rid))
+        other_deaths = self.start_alive - obs['alive'] - len(self.kills)
+        # Late storm eliminations are especially poor team evidence.
+        self.is_ffa = (len(self.rival_hits) >= 2 or
+                       (t < 120 and (other_deaths >= 3 or (other_deaths >= 1 and self.rival_hits))))
+        self.is_ffa = bool(self.is_ffa)
 
 
 class Bot:
-    name = "Oval Circuit"
+    name = 'Relay'
 
     def __init__(self, hello):
-        self.cfg = hello["config"]
-        self.rng = random.Random(hello["seed"])
+        self.cfg = hello['config']
         self.arena = Arena(hello)
-        self.combat = Combat(hello)
-        self.feet = Footwork(hello)
+        self.combat = Combat(hello, self.arena)
+        self.feet = Tactics(self.arena, self.cfg)
+        self.read = MatchRead(self.cfg)
         self.items = {}
-        self.enemy_hp = {}
-        self.enemy_hurt = {}
-        self.route_budget = (None, -1, 0.0)
-        self.skip_until = {}
-        self.item_goal = None
-        self.item_check = None
-        self.last_damage = -99
-        self.damage_source = None
-        self.recovering = False
-        self.shelter = None
-        self.shelter_until = -1
-        self.hold = None
-        self.hold_until = -1
-        self.waypoint = None
-        self.waypoint_until = -1
+        self.blocked_until = {}
+        self.actors = {}
+        self.focus = None
+        self.last_fight_lane = (None, -100.)
+        self.resource = None
+        self.resource_progress = None
+        self.sound = None
         self.visits = {}
-        self.mode = "explore"
-        self.start_alive = None
-        self.my_kills = 0
-        self.is_ffa = False
-        self.last_duel = None
-        self.finish_spot = None
-        self.finish_until = -1
+        self.sweep_dir = 1 if hello['seed'] % 2 else -1
+        self.waypoint = self.shelter = self.peek = None
+        self.sweep_due = self.shelter_due = self.peek_due = -1.
+        self.cover_ids = self.peek_id = None
+        self.last_exchange = -100.
+        self.damage_bearing = None
+        self.route_due, self.route_key, self.route_extra = -1., None, 0.
+        self.repairing = False
+        self.mode = 'hunt'
+        self.errors = 0
 
-    def remember(self, obs):
-        t, me = obs["t"], obs["self"]
-        pos = me["pos"]
-        if self.start_alive is None:
-            self.start_alive = obs.get("alive", 16)
-        seen = set()
-        for group in ("crates", "cubes", "pickups"):
-            for item in obs[group]:
-                i = item["id"]
-                self.items[i] = (group, item, t)
-                seen.add(i)
-        for e in obs["events"]:
-            if e["type"] == "kill":
-                self.my_kills += 1
-            if e["type"] == "damaged" and e.get("weapon") != "zone":
-                self.last_damage = t
-                if e.get("bearing") is not None:
-                    yaw = e["bearing"]
-                    self.damage_source = {"pos": (pos[0] + 70 * math.cos(yaw), pos[1] + 70 * math.sin(yaw), pos[2])}
-            if e["type"] == "took" or (e["type"] == "take_failed" and e.get("reason") in ("gone", "have")):
-                self.items.pop(e["id"], None)
-        for i, (group, item, last) in list(self.items.items()):
-            if i in seen:
-                continue
-            p = item["pos"]
-            if t - last > (80 if group == "pickups" else 25) or (distance(p, pos) < 7 and abs(p[2]-pos[2]) < 4):
-                del self.items[i]
-        own_hits = {e["target"] for e in obs["events"] if e["type"] == "hit"}
-        for enemy in obs["mechs"]:
-            if enemy["kind"] != "mech" or "hp" not in enemy:
-                continue
-            i = enemy["id"]
-            previous, last = self.enemy_hp.get(i, (enemy["hp"], -99))
-            if (i not in own_hits and t-last < 0.3 and previous-enemy["hp"] >= 12
-                    and distance(enemy["pos"], obs["zone"]["center"]) < obs["zone"]["radius"]):
-                self.enemy_hurt[i] = t
-            self.enemy_hp[i] = enemy["hp"], t
-        if not self.is_ffa:
-            others_dead = (self.start_alive - obs.get("alive", self.start_alive)) - self.my_kills
-            if (others_dead >= 2 and t < 100) or others_dead >= 4:
-                self.is_ffa = True
-        self.visits[(round(pos[0] / 28), round(pos[1] / 28))] = t
+    @property
+    def is_ffa(self):
+        return self.read.is_ffa
 
-    def gear_value(self, kind, obs):
-        # The arm gun complements every secondary and consumes no energy.
-        if kind == "laser":
-            return 5.2
-        if kind == "lightning":
-            return 5.5 if obs["zone"]["radius"] < 65 else 3.2
-        return {"mortar": 2.85, "gun": 3.1}.get(kind, 0)
+    def remember(self, obs, rivals):
+        me, t = obs['self'], obs['t']
+        p = me['pos']
+        self.read.update(obs, rivals)
+        for obj in rivals:
+            self.actors[obj['id']] = (t, obj)
+        visible = set()
+        for group in ('pickups', 'cubes', 'crates'):
+            for obj in obs[group]:
+                visible.add(obj['id'])
+                self.items[obj['id']] = (group, obj, t)
+        for e in obs['events']:
+            kind = e['type']
+            if kind == 'took' or (kind == 'take_failed' and e.get('reason') == 'gone'):
+                self.items.pop(e['id'], None)
+            if kind == 'kill':
+                self.actors.pop(e['target'], None)
+            if kind in ('hit', 'damaged') and e.get('weapon') != 'zone':
+                self.last_exchange = t
+            if kind == 'damaged' and e.get('bearing') is not None:
+                self.damage_bearing = (t, e['bearing'])
+        for key, (group, obj, stamp) in list(self.items.items()):
+            if key in visible:
+                continue
+            q = obj['pos']
+            # Inside proximity sensors, foliage cannot hide an item. A thin
+            # wall still can. Forget positively observed empty ground quickly.
+            if t-stamp > (75 if group == 'pickups' else 22) or (
+                    distance(p, q) < 27 and abs(q[2]-p[2]) < 5 and
+                    self.arena.clear((*p[:2], p[2]+me['stats']['eye_height']), (*q[:2], q[2]+1.2))):
+                del self.items[key]
+        self.visits[(round(p[0]/32), round(p[1]/32))] = t
+        sound_rules = self.cfg['sound']
+        for s in obs['sounds']:
+            if s['kind'] not in ('gun', 'mortar', 'laser', 'laser_charge', 'lightning', 'step', 'boost', 'reload', 'jet'):
+                continue
+            band = s['dist']
+            low, high = {'near': (0, sound_rules['near']), 'mid': (sound_rules['near'], sound_rules['mid']),
+                         'far': (sound_rules['mid'], sound_rules['range'].get(s['kind'], 300))}[band]
+            reach = min(sound_rules['range'].get(s['kind'], high), high)
+            estimate = .5*(low + reach)
+            strength = {'near': 3., 'mid': 2., 'far': 1.}[band] + (.45 if s['kind'] == 'laser_charge' else 0.)
+            stamp = t - s.get('age', 0.)
+            if self.sound and strength < self.sound[2] - .55*(stamp-self.sound[0]):
+                continue
+            yaw = s['bearing']
+            self.sound = (stamp, (p[0]+estimate*math.cos(yaw), p[1]+estimate*math.sin(yaw)), strength)
 
-    def equipment(self, obs, threats=()):
-        me = obs["self"]
-        held = [w["kind"] if w else None for w in me["weapons"]]
-        laser_danger = any("laser" in m.get("weapons", ()) for m in threats)
-        take = {}
-        best = 0
-        for p in obs["pickups"]:
-            if p["kind"] == "mortar" and laser_danger:
-                continue
-            if p["kind"] in held or distance(p["pos"], me["pos"]) >= self.cfg["loot"]["pickup_radius"]:
-                continue
-            if abs(p["pos"][2] - me["pos"][2]) >= 4:
-                continue
-            if None in held:
-                slot = held.index(None)
-                gain = self.gear_value(p["kind"], obs)
-            else:
-                # Retain the reliable arm gun even late in the ring.
-                slot = next((i for i, w in enumerate(held) if w != "gun"), 1)
-                gain = self.gear_value(p["kind"], obs) - self.gear_value(held[slot], obs)
-                if me["weapons"][slot].get("charge", 0) > 0:
-                    continue
-            if gain > best + 0.02:
-                best = gain
-                take = {"take": p["id"]}
-                if held[slot]:
-                    take["drop"] = slot
-        # Anti-cookoff: drop mortar immediately if a visible enemy holds a laser!
-        if not take and "mortar" in held and laser_danger:
-            take = {"drop": held.index("mortar")}
-        return take
+    def weapon_value(self, kind, obs, rivals):
+        if kind == 'gun':
+            return 11.  # Recover the permanent arm if presented with a gunless loadout.
+        if kind == 'laser':
+            return 8.
+        if kind == 'lightning':
+            return 9. if obs['zone']['radius'] < 38 else 6.3
+        if kind == 'mortar':
+            return -2. if any('laser' in r.get('weapons', ()) for r in rivals) else 4.4
+        return 0.
 
-    def upgrade(self, obs):
-        me = obs["self"]
-        values = {"gun_mag": 9.4, "plating": 9.25, "gun_damage": 8.35, "armor": 8.5,
-                  "servos": 7.9, "nanites": 8.7, "laser_damage": 8.6,
-                  "lightning_range": 8.5, "gun_rate": 7.25, "gun_velocity": 7.1,
-                  "laser_charge": 6.7, "mortar_reload": 7.55, "mortar_velocity": 7.65,
-                  "lightning_efficiency": 7.65, "mortar_splash": 7.2, "jets": 6.0,
-                  "reactor": 5.9, "capacitor": 5.5, "sensors": 6.4, "gyros": 5.8,
-                  "laser_pierce": 4.2, "lightning_chain": 4.5}
-        if "gun_mag" in me["upgrades"]:
-            values["gun_mag"] -= 1.55
-        if obs["zone"]["radius"] < 75:
-            values["plating"] += 1.35
-            values["nanites"] -= 1.5
-            values["lightning_efficiency"] += 1.0
-        if "nanites" in me["upgrades"]:
-            values["nanites"] -= 0.8
-        return max(enumerate(obs["offer"]["choices"]), key=lambda it: values.get(it[1]["id"], 4))[0]
-
-    def threat_list(self, obs):
-        me = obs["self"]
-        pos = me["pos"]
-        eye = (*pos[:2], pos[2] + me["stats"]["eye_height"])
-        ranked = sorted((m for m in obs["mechs"] if m["kind"] == "mech"), key=lambda m: distance(m["pos"], pos))
-        threats = []
-        for m in ranked[:5]:
-            p = m["pos"]
-            height = self.cfg["mech"]["height"] * (1 + self.cfg["cubes"]["size_per_cube"] * m.get("cubes", 0))
-            if self.arena.clear(eye, (*p[:2], p[2] + 0.72 * height)):
-                threats.append(m)
-        return threats, ranked
-
-    def loot(self, obs, enemies):
-        me, t, zone = obs["self"], obs["t"], obs["zone"]
-        pos = me["pos"]
-        armed = [w["kind"] for w in me["weapons"] if w]
-        secondary = next((k for k in armed if k != "gun"), None)
-        fraction = me["hp"] / me["max_hp"]
-        cube_cap = self.cfg["cubes"]["stat_cap"] if self.is_ffa else 15
-        candidate, highest = None, 0
-        objects = list(self.items.values())
-        objects.extend(("npc", m, t) for m in obs["mechs"] if m["kind"] == "npc")
-        objects.extend(("drop", m, t) for m in obs.get("drops", []))
-        for group, item, last in objects:
-            p, i = item["pos"], item["id"]
-            if self.skip_until.get(i, 0) > t:
-                continue
-            d = distance(pos, p)
-            climb = max(0, p[2] - self.arena.ground(*p[:2]) - 3.7)
-            uphill = max(0, p[2] - pos[2] - 3)
-            if climb and uphill > min(43, me["max_energy"] * 0.41):
-                continue
-            if d > (220 if (group == "drop" or (group == "pickups" and item["kind"] == "laser" and secondary != "laser" and zone["radius"] >= 65)) else 153):
-                continue
-            travel = d / max(1, me["stats"]["walk_speed"] * 0.97) + (uphill / 6.5 if climb else 0)
-            center, radius = future_ring(zone, t, travel + 5)
-            over = max(0, distance(p, center) - radius + 2)
-            if over > 3.0:
-                continue
-            owner = None
-            if group == "pickups":
-                if item["kind"] in armed:
-                    continue
-                if item["kind"] == "mortar" and any("laser" in m.get("weapons", ()) for m in enemies):
-                    continue
-                gain = self.gear_value(item["kind"], obs) - (self.gear_value(secondary, obs) if secondary else 0)
-                if gain <= 0.1:
-                    continue
-                if item["kind"] == "laser" and secondary != "laser" and zone["radius"] >= 65:
-                    worth = 28.0 if not secondary else 20.0
-                else:
-                    worth = (4 + gain * 3.6) if not secondary else (2 + gain * 2.4)
-            elif group == "drop":
-                owner = item.get("holder")
-                if owner is not None and owner != me["id"] and item["progress"] + travel > item["capture_s"] + 1:
-                    continue
-                wait = max(0, item["lands_in"] - travel)
-                if wait > 9:
-                    continue
-                worth = 16 + (1 - fraction) * 32
-                if me["cubes"] >= cube_cap and fraction > 0.9:
-                    worth *= 0.52
-                travel += wait + max(0, item["capture_s"] - (item["progress"] if owner == me["id"] else 0))
-            else:
-                worth = {"crates": 6.8, "cubes": 8.4, "npc": 10.8}[group]
-                if me["cubes"] == 0:
-                    worth *= 1.28
-                if group == "crates" and not secondary:
-                    worth += 3
-                if group != "cubes":
-                    travel += 1 + item.get("hp", 300) / (230 if secondary else 150)
-                if me["cubes"] >= cube_cap:
-                    worth *= 0.30 if group != "cubes" else 0.48
-            score = worth / (2.25 + travel + over)
-            if self.item_goal == i:
-                score *= 1.25
-            score *= max(0.5, 1 - (t - last) * 0.022)
-            if enemies:
-                if any(distance(e["pos"], p) < 30 for e in enemies):
-                    score *= 0.25 if group == "drop" else 0.48
-                if group in ("npc", "crates") or d > 28:
-                    score *= 0.57
-            if group == "drop" and owner == me["id"]:
-                score += 8
-            if score > highest:
-                candidate, highest = (group, item), score
-        return candidate, highest
-
-    def remember_goal(self, candidate, obs):
-        if candidate is None:
-            self.item_goal = self.item_check = None
+    def equip(self, obs, rivals, action):
+        me = obs['self']
+        arms = me['weapons']
+        kinds = [w['kind'] if w else None for w in arms]
+        slot = next((i for i,k in enumerate(kinds) if k is None), None)
+        if slot is None:
+            slot = min((i for i,k in enumerate(kinds) if k != 'gun' and not arms[i].get('charge',0)),
+                       key=lambda i: self.weapon_value(kinds[i],obs,rivals), default=None)
+        if slot is None or (arms[slot] or {}).get('charge', 0) > 0:
             return
-        item = candidate[1]
-        t, pos = obs["t"], obs["self"]["pos"]
-        d = math.dist(item["pos"], pos)
-        if self.item_goal == item["id"] and self.item_check:
-            start, best = self.item_check
-            if d < best - 5:
-                self.item_check = (t, d)
-            elif t - start > (11 if candidate[0] == "drop" else 6) and d > 6:
-                self.skip_until[item["id"]] = t + 20
-                self.item_check = None
-        else:
-            self.item_check = (t, d)
-        self.item_goal = item["id"]
+        held = self.weapon_value(kinds[slot], obs, rivals)
+        candidates = [(self.weapon_value(item['kind'], obs, rivals), item['id']) for item in obs['pickups']
+                      if item['kind'] not in kinds and abs(item['pos'][2] - me['pos'][2]) <= 4 and
+                      distance(item['pos'], me['pos']) <= self.cfg['loot']['pickup_radius']]
+        if candidates:
+            value, item_id = max(candidates)
+            if value > max(0., held):
+                action['take'] = item_id
+                if arms[slot]:
+                    action['drop'] = slot
+                return
+        if held < 0:
+            action['drop'] = slot
 
-    def explore(self, obs):
-        t, me, zone = obs["t"], obs["self"], obs["zone"]
-        pos = me["pos"]
-        center, radius = future_ring(zone, t, 20)
-        if self.waypoint and self.waypoint_until > t and distance(pos, self.waypoint) > 6 and distance(self.waypoint, center) <= radius:
-            return self.waypoint
-        best = None
-        value = -math.inf
-        for _ in range(23):
-            a = self.rng.uniform(-math.pi, math.pi)
-            d = self.rng.uniform(min(27, radius * 0.35), min(88, max(12, radius)))
-            p = inside_goal((pos[0]+d*math.cos(a), pos[1]+d*math.sin(a)), center, radius * 0.90)
-            if not self.arena.walkable(*p):
+    def upgrade(self, me, choices, zone):
+        values = {'gun_mag': 9.8, 'plating': 9.4, 'nanites': 9.25, 'armor': 8.8,
+                  'laser_damage': 8.9, 'gun_damage': 8.6, 'servos': 8.1, 'lightning_range': 8.55,
+                  'gun_rate': 7.9, 'gun_velocity': 7.8, 'laser_charge': 8.05,
+                  'lightning_efficiency': 7.8, 'mortar_velocity': 7.7, 'mortar_reload': 7.65,
+                  'mortar_splash': 7.35, 'jets': 6.5, 'sensors': 6.8, 'reactor': 6.3,
+                  'capacitor': 6.1, 'gyros': 5.9, 'lightning_chain': 5.5, 'laser_pierce': 5.4}
+        if 'gun_mag' in me['upgrades']:
+            values['gun_mag'] -= 1.55
+        if 'nanites' in me['upgrades']:
+            values['nanites'] -= .5
+        if zone['radius'] < 55 or me['hp'] < .55*me['max_hp']:
+            values['plating'] += 1.4
+        return max(range(len(choices)), key=lambda i: values.get(choices[i]['id'], 5.))
+
+    def contacts(self, obs, rivals):
+        me, p = obs['self'], obs['self']['pos']
+        st = me['stats']
+        origin = (*p[:2], p[2]+st['muzzle_height'])
+        arms = {w['kind']: w for w in me['weapons'] if w}
+        gun = arms.get('gun', {}).get('stats', self.cfg['weapons']['gun'])
+        # First rank all actors cheaply; reserve exact rays for the best few.
+        contacts = []
+        for r in rivals:
+            q = r['pos']
+            d = distance(p, q)
+            facing = math.cos(math.atan2(p[1]-q[1],p[0]-q[0])-r['aim'][0])
+            hp = r.get('hp', self.cfg['mech']['hp'])
+            sustained = gun['damage']/(gun['cooldown'] + gun['reload']/gun['mag'])
+            sustained *= max(.30, 1. - max(0., d-65)/320) if d < gun['range']+4 else .1
+            if 'laser' in arms:
+                beam = arms['laser']['stats']
+                if d < beam['range']:
+                    sustained += beam['damage'] * (1.+beam['cookoff']*('mortar' in r.get('weapons', ()))) / (beam['charge']+beam['cooldown']+.1)
+            if 'lightning' in arms and d < arms['lightning']['stats']['range']+5:
+                arc = arms['lightning']['stats']
+                sustained += arc['damage']/arc['cooldown']
+            if 'mortar' in arms and 16 < d < 180:
+                sustained += 40.
+            if facing < 0:
+                sustained *= 1.15
+            cost = hp/max(20., sustained) + d/70. - 1.65*(self.focus == r['id'])
+            cost -= 2.8*(d < 46) + 1.2*(facing > .9 and r.get('charging', False))
+            contacts.append((cost, r['id'], r))
+        contacts.sort(key=lambda entry: entry[:2])
+        assessed = []
+        for i, (cost, rid, r) in enumerate(contacts):
+            if i >= 6:
+                break
+            q = r['pos']
+            h = self.cfg['mech']['height']*(1+self.cfg['cubes']['size_per_cube']*r.get('cubes',0))
+            opened = self.arena.clear(origin, (*q[:2], q[2]+.55*h)) or self.arena.clear(origin, (*q[:2], q[2]+.90*h))
+            assessed.append((cost + (0. if opened else 25.), rid, dict(r, _open=opened)))
+        assessed.sort(key=lambda entry: entry[:2])
+        return [r for _, _, r in assessed]
+
+    def ground_goal(self, p, center, radius):
+        """Prefer ground inside the destination disk. A roof is sometimes the only surface."""
+        xy = into_disk(p, center, max(0., radius - min(12., .25*radius)))
+        if self.arena.walkable(*xy):
+            return (*xy, self.arena.ground(*xy))
+        candidates = []
+        for offset in (min(9., radius*.6), min(24., radius*.82)):
+            if offset < 1.:
                 continue
-            recent = self.visits.get((round(p[0]/28), round(p[1]/28)), -100)
-            score = min(1.1, (t-recent)/36) + self.rng.random() * 0.3
-            clearance = self.arena.ground_clearance(*p)
-            score += 0.85 * max(0, 1 - abs(clearance - 12) / 36)
-            score -= abs(distance(p, center) - 0.61 * min(radius, zone["next_radius"])) / max(70, radius)
-            if score > value:
-                best, value = p, score
-        self.waypoint = best or center
-        self.waypoint_until = t + 9
-        return self.waypoint
+            for j in range(12):
+                a = j*math.tau/12
+                q = (xy[0]+offset*math.cos(a), xy[1]+offset*math.sin(a))
+                if distance(q, center) < radius-.5 and self.arena.walkable(*q):
+                    candidates.append(q)
+        if candidates:
+            xy = min(candidates, key=lambda q: distance(p, q))
+            return (*xy, self.arena.ground(*xy))
+        return (*xy, self.arena.roof(*xy))
 
-    def protect(self, pos, enemies, zone, t):
-        center, radius = future_ring(zone, t, 8)
-        if t >= self.shelter_until or (self.shelter is not None and distance(self.shelter, center) > radius):
-            self.shelter = self.arena.cover(pos, enemies, center, max(1, radius - min(4, radius*0.1)), retreat=True)
-            self.shelter_until = t + 1.25
+    def rotation(self, obs):
+        me, z, t = obs['self'], obs['zone'], obs['t']
+        p, c, r = me['pos'], z['next_center'], z['next_radius']
+        center, future = ring_at(z,t,5.)
+        need = distance(p,c) - max(0., r-min(12., r*.25))
+        if me['in_zone'] and need < max(.25, r*.025) and z['radius'] > 6:
+            return None
+        # Cache detour and ascent time; actor movement alone must not rebuild A*.
+        key = (*c,r)
+        if self.route_key != key or t >= self.route_due:
+            self.route_key, self.route_due = key, t+2.
+            goal = self.ground_goal(p,c,r)
+            self.route_extra = min(140., max(0., self.arena.travel_bound(p,goal)-distance(p,goal)))
+            self.route_climb = max(0.,goal[2]-p[2]-2.) if not self.arena.walkable(*goal[:2]) else 0.
+        eta = (max(0., need) + self.route_extra) / max(1., me['stats']['walk_speed']*.83) + self.route_climb/6.5 + 4.
+        if (not me['in_zone'] or z['radius'] < 6 or distance(p,center) > max(0., future-min(4., future*.12))
+                or (need > 1. and t+eta >= z['shrink_end'])):
+            return Plan('rotate', self.ground_goal(p, c, r))
+        return None
+
+    def resources(self, obs, contacts):
+        me, t, zone = obs['self'], obs['t'], obs['zone']
+        p, st = me['pos'], me['stats']
+        kinds = [w['kind'] for w in me['weapons'] if w]
+        secondary = next((k for k in kinds if k != 'gun'), None)
+        old = self.weapon_value(secondary, obs, contacts)
+        cc = self.cfg['cubes']
+        cubes = me['cubes']
+        next_offer = next((n for n in cc['upgrade_thresholds'] if n>cubes), math.inf)
+        marginal = (1. if cubes < cc['stat_cap'] else .60 if cubes < 15 else .19)
+        objects = list(self.items.values())
+        objects.extend(('npc', a, t) for a in obs['mechs'] if a['kind']=='npc')
+        objects.extend(('drop', a, t) for a in obs.get('drops', ()))
+        best = None
+        for group, item, seen in objects:
+            key, q = item['id'], item['pos']
+            if self.blocked_until.get(key, -1.) > t:
+                continue
+            d = distance(p,q)
+            if d > (300 if group=='drop' else 172):
+                continue
+            climb = max(0., q[2]-p[2]-3.) if q[2] > self.arena.ground(*q[:2])+3. else 0.
+            if climb > st['max_rise_speed']*me['max_energy']/max(1.,st['jet_drain'])*.84:
+                continue
+            eta = d / (st['walk_speed']*1.12) + climb/6.5
+            owner = item.get('holder')
+            if group=='pickups':
+                if item['kind'] in kinds:
+                    continue
+                gain = self.weapon_value(item['kind'], obs, contacts)-max(0.,old)
+                if gain <= 0:
+                    continue
+                benefit = (9. if not secondary else 1.) + 2.3*gain
+            elif group=='drop':
+                if owner not in (None, me['id']) and item['progress']+eta >= item['capture_s']+.3:
+                    continue
+                cap = item['capture_s'] - (item['progress'] if owner == me['id'] else 0.)
+                eta = max(item['lands_in'], eta)+max(0.,cap)
+                benefit = 16.*marginal + 65.*(1-me['hp']/me['max_hp'])
+                if owner == me['id']:
+                    benefit += item['progress']*7.
+            else:
+                yield_count = self.cfg['npc' if group=='npc' else 'crates']['cubes'] if group!='cubes' else 1
+                benefit = marginal*(8.*yield_count + 5.*(yield_count >= next_offer-cubes))
+                if group!='cubes':
+                    eta += item.get('hp',300.)/(170. if secondary else 103.)
+                    if group=='crates' and not secondary:
+                        benefit += 5.
+            c,r = ring_at(zone,t,eta+3.)
+            if distance(c,q) > r-min(1.5, r*.1):
+                continue
+            if self.resource == key:
+                benefit *= 1.14
+            benefit *= max(.45, 1.-(t-seen)*.028)
+            if contacts and group in ('cubes','crates','npc','drop'):
+                foe_distance = min(distance(q, e['pos']) for e in contacts)
+                if foe_distance + 8 < d or (group=='drop' and foe_distance <= item['radius']):
+                    benefit *= .18
+            value = benefit / (eta+2.4)
+            if best is None or value > best[0]:
+                best = (value, group, item)
+        return best
+
+    def follow(self, resource, obs):
+        value, group, obj = resource
+        p, q = obs['self']['pos'], obj['pos']
+        if group in ('npc','crates'):
+            # A roof crate needs a firing platform on the same roof. Start on
+            # the approach side, then look around the object if that side is blocked.
+            st = obs['self']['stats']
+            gap = max(13., st['muzzle_height']*1.65) + (8. if group=='npc' else 0.)
+            bearing = math.atan2(p[1]-q[1],p[0]-q[0])
+            raised = q[2] > self.arena.ground(*q[:2])+3.
+            height = self.cfg['npc' if group=='npc' else 'crates']['height']
+            for offset in (0.,.7,-.7,1.5,-1.5,math.pi):
+                a = bearing + offset
+                xy = q[0]+gap*math.cos(a),q[1]+gap*math.sin(a)
+                if raised:
+                    z = self.arena.roof(*xy)
+                    if abs(z-q[2]) > 3.5:
+                        continue
+                else:
+                    if not self.arena.walkable(*xy):
+                        continue
+                    z = self.arena.ground(*xy)
+                dz = q[2]+height*.55-z-st['muzzle_height']
+                if st['min_pitch'] < math.atan2(dz,gap) < st['max_pitch'] and self.arena.clear(
+                        (*xy,z+st['muzzle_height']), (*q[:2],q[2]+height*.55)):
+                    q = (*xy,z)
+                    break
+        return Plan('capture' if group=='drop' else 'collect', q, obj['id'])
+
+    def cover_goal(self, obs, threats, c, r):
+        t, p = obs['t'], obs['self']['pos']
+        ids = tuple(sorted(e['id'] for e in threats[:3]))
+        if t >= self.shelter_due or self.cover_ids != ids or (self.shelter and distance(self.shelter,c)>r):
+            self.shelter_due, self.cover_ids = t+.85, ids
+            xy = self.arena.cover(p, threats[:3], c, max(0.,r-2), retreat=bool(threats))
+            self.shelter = (*xy,self.arena.ground(*xy)) if xy else None
         return self.shelter
 
-    def plan(self, obs, threats, known):
-        me, zone, t = obs["self"], obs["zone"], obs["t"]
-        pos = me["pos"]
-        hp = me["hp"] / me["max_hp"]
-        low, high = (0.60, 0.91) if self.is_ffa else (0.48, 0.86)
-        self.recovering = (hp < low or (self.recovering and hp < high)) and me["in_zone"]
-        if self.recovering and zone["radius"] < 20:
-            self.recovering = False
-        center, radius = future_ring(zone, t, 15)
-        to_next = distance(pos, zone["next_center"])
-        safe_next = max(0, zone["next_radius"] - min(15, 0.22 * zone["next_radius"]))
-        remaining = max(0.0, to_next - safe_next)
-        if remaining > 16:
-            key, expires, detour = self.route_budget
-            current = (*zone["next_center"], zone["next_radius"])
-            if key != current or expires <= t:
-                dest = inside_goal(pos, zone["next_center"], safe_next)
-                detour = min(125, max(0, self.arena.travel_bound(pos, dest) - remaining))
-                self.route_budget = current, t + 2, detour
-            remaining += detour
-        eta = 5 + remaining / max(1, me["stats"]["walk_speed"] * 0.67)
-        if (zone["next_radius"] < 10 and not self.arena.walkable(*zone["next_center"])
-                and self.arena.roof(*zone["next_center"]) > pos[2] + 3):
-            eta += 8 + max(0, self.arena.roof(*zone["next_center"]) - pos[2]) / 6
-        rotate = (not me["in_zone"] or distance(pos, center) > max(0, radius - min(5, radius*0.1))
-                  or (to_next > safe_next + 3 and t + eta >= zone["shrink_end"]))
-        # Bank a near-complete repair before moving again. The reward is
-        # immediate, and exiting the capture area resets its progress.
-        for drop in obs.get("drops", []):
-            remaining = drop["capture_s"] - drop["progress"]
-            if (drop.get("holder") == me["id"] and drop["lands_in"] <= 0 and remaining <= 0.8
-                    and distance(pos, drop["pos"]) < drop["radius"]
-                    and me["hp"] > max(0, remaining) * (zone["dps"] if not me["in_zone"] else 0) + 1
-                    and not any(distance(m["pos"], drop["pos"]) < drop["radius"] for m in threats)):
-                return "capture", drop["pos"], None, drop["radius"] * 0.7, False
-        if zone["radius"] <= 5:
-            return "last", zone["next_center"], None, 0, False
-        if rotate:
-            dest = inside_goal(pos, zone["next_center"], safe_next)
-            # A current ring and its following ring can differ greatly. Move
-            # well clear of the current edge even if the next edge is close.
-            if distance(pos, dest) < 4:
-                dest = inside_goal(pos, center, max(0, radius - min(22, radius*0.4)))
-            return "rotate", dest, None, 0, False
-        loot, value = self.loot(obs, threats)
-        closest = distance(pos, threats[0]["pos"]) if threats else math.inf
-        if loot and loot[0] == "drop":
-            drop = loot[1]
-            radius_cap = drop["radius"]
-            capturing = distance(pos, drop["pos"]) < radius_cap and drop["lands_in"] < 1
-            rem_cap = drop["capture_s"] - (drop["progress"] if drop.get("holder") == me["id"] else 0.0)
-            drop_ambush = (len(threats) >= 2 and closest < 65.0 and rem_cap > 1.3)
-            if not drop_ambush and (capturing or hp < 0.72) and closest > (15 if capturing else 42) and value > 0.65:
-                self.remember_goal(loot, obs)
-                return "capture", drop["pos"], None, radius_cap * 0.47, self.recovering and not threats
-        under_fire = t - self.last_damage < 2.8
-        outnumbered = sum(distance(pos, m["pos"]) < 130 for m in threats) >= 2
-        aimed = sum(math.cos(m["aim"][0] - math.atan2(pos[1] - m["pos"][1], pos[0] - m["pos"][0])) > 0.92 for m in threats)
-        # In a free-for-all, two opponents exchanging fire can yield a place
-        # for free. Look for an actual health loss and another mech facing it.
-        trading = False
-        if len(threats) >= 2 and not under_fire and not aimed:
-            for victim in threats:
-                if t - self.enemy_hurt.get(victim["id"], -99) > 1.25 or victim.get("hp", 0) < 300:
-                    continue
-                for shooter in threats:
-                    if shooter["id"] == victim["id"]:
+    def search(self, obs, c, r):
+        me, t = obs['self'], obs['t']
+        p = me['pos']
+        if self.sound and t-self.sound[0] < 4. and not (self.is_ffa and obs['alive'] > 2):
+            q = self.sound[1]
+            # A bearing + distance band gives a sector. Approach an offset inside
+            # the safe disk for a new sightline, never fire at this estimate.
+            d = max(.01, distance(p,q))
+            f = min(.68, 62./d)
+            xy = into_disk((p[0]+f*(q[0]-p[0]), p[1]+f*(q[1]-p[1])),c,max(0.,r-5.))
+            if self.arena.walkable(*xy):
+                return (*xy,self.arena.ground(*xy))
+        if self.waypoint and t < self.sweep_due and distance(p,self.waypoint) > 8 and distance(c,self.waypoint)<r:
+            return self.waypoint
+        # Walk successive sectors just inside the occupied annulus. The radial
+        # term draws far spawns inward; visited cells and wall distance choose lanes.
+        theta = math.atan2(p[1]-c[1],p[0]-c[0])
+        belt = min(r*.78, max(r*.44, obs['zone']['next_radius']*.82))
+        best, high = None, -math.inf
+        for side in (self.sweep_dir,-self.sweep_dir):
+            bypass = theta + side*.36
+            anchor = (c[0]+belt*math.cos(bypass),c[1]+belt*math.sin(bypass))
+            heading = math.atan2(anchor[1]-p[1],anchor[0]-p[0])
+            for step in (38.,72.):
+                for delta in (0.,-.44,.44,-.88,.88):
+                    a = heading+delta
+                    q = into_disk((p[0]+step*math.cos(a),p[1]+step*math.sin(a)),c,max(0.,r-3.))
+                    if not self.arena.walkable(*q) or distance(p,q)<4.:
                         continue
-                    vp, sp = victim["pos"], shooter["pos"]
-                    bearing = math.atan2(vp[1] - sp[1], vp[0] - sp[0])
-                    if math.cos(shooter["aim"][0] - bearing) > 0.97:
-                        trading = True
-                        break
-        hurt_or_focused = self.recovering or trading or (outnumbered and (under_fire or hp < 0.88 or aimed >= 2))
-        has_laser = any(w and w["kind"] == "laser" for w in me["weapons"])
-        has_light = any(w and w["kind"] == "lightning" for w in me["weapons"])
-        naked_vs_laser = (not has_laser and zone["radius"] > 80 and threats
-                          and not (has_light and closest <= 52.0)
-                          and any("laser" in m.get("weapons", ()) and m.get("hp", 1400) > 450 for m in threats))
-        if naked_vs_laser:
-            hurt_or_focused = True
-        if (not self.is_ffa and len(threats) == 1 and not outnumbered and not trading
-                and me["hp"] > 400 and threats[0].get("hp", 9999) <= 480 and closest < 175):
-            hurt_or_focused = False
-        attackers = threats or known or ([self.damage_source] if under_fire and self.damage_source else [])
-        if attackers and hurt_or_focused and zone["radius"] > 16:
-            escape = self.protect(pos, attackers, zone, t)
-            if escape is not None:
-                return "retreat", escape, None, 0.0 if threats else 1.0, trading or (self.recovering and not threats)
-            if outnumbered or not known:
-                dx, dy = unit(pos[0] - attackers[0]["pos"][0], pos[1] - attackers[0]["pos"][1])
-                escape = inside_goal((pos[0]+35*dx, pos[1]+35*dy), center, radius*0.92)
-                return "retreat", escape, None, 0, trading
+                    visit = self.visits.get((round(q[0]/32),round(q[1]/32)),-100.)
+                    barrier = self.arena.ground_clearance(*q)
+                    v = (min(1., (t-visit)/30.) + .45*(side==self.sweep_dir) - abs(delta)*.37
+                         - .012*abs(barrier-11.) - .005*distance(anchor,q))
+                    if v > high:
+                        high,best = v,q
+        self.sweep_due = t+6.5
+        self.waypoint = (*best,self.arena.ground(*best)) if best else self.ground_goal(c,c,r)
+        return self.waypoint
+
+    def plan(self, obs, contacts, resource):
+        me, t, z = obs['self'], obs['t'], obs['zone']
+        p = me['pos']
+        center, radius = ring_at(z, t, 8.)
+        target = contacts[0] if contacts else None
+        visible = [e for e in contacts if e['_open']]
+        fraction = me['hp']/me['max_hp']
+        finals = self.is_ffa and obs['alive'] > 2
+        rotate = self.rotation(obs)
+        if rotate:
+            return rotate
+        if resource:
+            value, group, obj = resource
+            d = distance(p,obj['pos'])
+            if group == 'drop' and (obj.get('holder') == me['id'] or
+                    (value > 1.7 and (not visible or fraction < .78 or d < obj['radius']+5.))):
+                return self.follow(resource,obs)
+            # A second arm on our route pays for itself in a single duel.
+            # Avoid crossing a rival or delaying a finish to obtain it.
+            if visible and group in ('pickups','cubes'):
+                foe = min(distance(p,e['pos']) for e in visible)
+                bare = not all(me['weapons'])
+                reach = min(68.,.55*foe) if group=='pickups' and bare else min(13.,.30*foe)
+                if d < reach and value > 1.1 and target.get('hp',1400) > 280:
+                    return self.follow(resource,obs)
+            if target and not visible and group=='pickups' and not all(me['weapons']) and d < 30. and value > 1.2:
+                return self.follow(resource,obs)
+        self.repairing = fraction < (.57 if finals else .38) or (self.repairing and fraction < (.89 if finals else .72))
+        finish = (target is not None and target.get('hp',1400) <= min(.5*me['hp'], 390.) and len(visible)<=2)
+        if finals and target and not finish and radius>18:
+            # A rival aiming away usually has somewhere else to spend its ammo.
+            engaged = any(e.get('charging') or math.cos(math.atan2(p[1]-e['pos'][1],p[0]-e['pos'][0])-e['aim'][0]) > .88 for e in visible)
+            if not engaged and t-self.last_exchange>3. and min(distance(p,e['pos']) for e in contacts)>53.:
+                safe = self.cover_goal(obs, contacts, center, radius)
+                if safe:
+                    return Plan('hold',safe)
+        if self.repairing and radius>18. and not finish:
+            safe = self.cover_goal(obs, contacts, center, radius)
+            if safe:
+                return Plan('recover',safe)
+            if not visible:
+                return Plan('recover',p)
+        if target and target['_open']:
+            return Plan('fight',target['pos'])
+        if target:
+            # Keep a cover break long enough to beat the incoming release or
+            # to reload. The first occluded observation is often the best place
+            # to stand for another few ticks. Then resume the pursuit.
+            last_id, last_t = self.last_fight_lane
+            guns_ready = any(w and max(w['cooldown'],w.get('reload',0.)) < .35 and
+                             (w['kind'] != 'lightning' or distance(p,target['pos']) < w['stats']['range'])
+                             for w in me['weapons'])
+            if last_id == target['id'] and t-last_t < .85 and (not guns_ready or target.get('charging')):
+                return Plan('fight',target['pos'])
+            # Actors in server memory have real current coordinates. A lateral
+            # peek usually rebuilds the lane faster than running at the wall.
+            if self.peek_id != target['id'] or t >= self.peek_due:
+                self.peek_id,self.peek_due = target['id'],t+.65
+                xy = self.arena.peek_spot(p,target,center,max(0.,radius-2.))
+                self.peek = (*xy,self.arena.ground(*xy)) if xy else None
+            if not finals and (self.peek or not resource or self.focus==target['id'] or target.get('hp',1400)<500):
+                return Plan('hunt', self.peek or target['pos'])
+        if resource:
+            value, group, obj = resource
+            if (not finals and value > (.80 if me['cubes']>=10 and all(me['weapons']) else .31)) or (
+                    finals and value > (1.35 if me['cubes']>=3 and all(me['weapons']) else .7)):
+                return self.follow(resource,obs)
+        if finals:
+            safe = self.cover_goal(obs,contacts,center,radius)
+            if safe:
+                return Plan('hold',safe)
+        last = self.actors.get(self.focus)
+        if not finals and last and t-last[0] < 3. and distance(last[1]['pos'],center)<radius:
+            return Plan('hunt',last[1]['pos'])
+        return Plan('hunt', self.search(obs,center,radius))
+
+    def update_progress(self, plan, obs):
+        t = obs['t']
+        d = math.dist(obs['self']['pos'], plan.goal) if len(plan.goal) == 3 else distance(obs['self']['pos'], plan.goal)
+        hitting = any(e['type']=='hit' and e['target']==plan.resource for e in obs['events'])
+        capturing = plan.mode=='capture' and any(d['id']==plan.resource and
+                       (d.get('holder') == obs['self']['id'] or d['lands_in']>0) for d in obs.get('drops',()))
+        if self.resource != plan.resource or self.resource_progress is None:
+            self.resource_progress = (t,d)
+        elif plan.resource is not None:
+            since, best = self.resource_progress
+            if best-d > 3. or hitting or capturing:
+                self.resource_progress = (t,d)
+            elif t-since > (12. if plan.mode=='capture' else 7.):
+                self.blocked_until[plan.resource] = t+12.
+                self.resource_progress = None
+        self.resource = plan.resource
+
+    def farm_target(self, obs, plan):
+        me, p = obs['self'], obs['self']['pos']
+        choices = []
+        for obj in obs['mechs']:
+            if obj['kind']=='npc':
+                choices.append(obj)
+        choices.extend(dict(crate,kind='crate') for crate in obs['crates'])
+        # Collect what we shoot. An uncollected distant cube buys no advantage.
+        candidates = []
+        for obj in choices:
+            q = obj['pos']
+            d = distance(p,q)
+            direct = obj['id'] == plan.resource
+            if not direct and (d>53. or distance(q,plan.goal)>46.):
+                continue
+            gain = (1.45 if obj['kind']=='npc' else 1.) / (1.+d/45.)
+            gain *= 1.+.55*(1.-min(1.,obj.get('hp',300.)/self.cfg['npc' if obj['kind']=='npc' else 'crates']['hp']))
+            candidates.append((gain+2.*direct,obj['id'],obj))
+        eye = (*p[:2], p[2]+me['stats']['muzzle_height'])
+        for _, _, obj in sorted(candidates,reverse=True)[:3]:
+            q = obj['pos']
+            body = self.cfg['npc' if obj['kind']=='npc' else 'crates']
+            if self.arena.clear(eye,(*q[:2],q[2]+.6*body['height'])):
+                return obj
+        return None
+
+    def decide(self, obs):
+        me, t, p = obs['self'], obs['t'], obs['self']['pos']
+        self.arena.set_body(me['stats'])
+        rivals = [a for a in obs['mechs'] if a['kind']=='mech' and a.get('hp',1)>0]
+        self.remember(obs,rivals)
+        contacts = self.contacts(obs,rivals)
+        resources = self.resources(obs,contacts)
+        plan = self.plan(obs,contacts,resources)
+        self.mode = plan.mode
+        self.update_progress(plan,obs)
+        target = contacts[0] if contacts else None
+        if target:
+            self.focus = target['id']
+            if target['_open'] and plan.mode=='fight':
+                self.last_fight_lane = target['id'],t
+        object_to_shoot = target
+        if plan.mode == 'hold' or (plan.mode=='recover' and (target is None or not target['_open'])):
+            object_to_shoot = None
+        elif target is None and plan.mode == 'collect':
+            object_to_shoot = self.farm_target(obs,plan)
+        if target:
+            goal = target['pos']
+            yaw = math.atan2(goal[1]-p[1],goal[0]-p[0])
+        elif self.damage_bearing and t-self.damage_bearing[0] < 1.1:
+            yaw = self.damage_bearing[1]
+        elif self.sound and t-self.sound[0] < 2.1:
+            q = self.sound[1]
+            yaw = math.atan2(q[1]-p[1],q[0]-p[0])
         else:
-            self.shelter = None
-            self.shelter_until = -1
-        # Opus #4: 5-second kill window when a wounded duel target slips behind cover.
-        if not self.is_ffa and not threats and not self.recovering and zone["radius"] > 22 and self.last_duel is not None:
-            duel_id, duel_t, duel_hp = self.last_duel
-            wounded = next((m for m in known if m["id"] == duel_id), None)
-            if wounded is None or t - duel_t > 5.0:
-                self.last_duel = None
-                self.finish_spot = None
-            else:
-                whp = wounded.get("hp", 9999)
-                has_laser = any(w and w["kind"] == "laser" for w in me["weapons"])
-                cube_mult = 1 + self.cfg["cubes"]["damage_per_cube"] * min(me["cubes"], self.cfg["cubes"]["stat_cap"])
-                thresh = (450.0 if has_laser else 300.0) * cube_mult
-                isolated = all(m["id"] == duel_id or distance(m["pos"], wounded["pos"]) >= 100.0 for m in known)
-                if whp > duel_hp + 1.0 or whp > thresh or not isolated:
-                    self.last_duel = None
-                    self.finish_spot = None
-                else:
-                    if whp < duel_hp:
-                        self.last_duel = (duel_id, duel_t, whp)
-                    if (self.finish_spot is None or t >= self.finish_until
-                            or distance(self.finish_spot, center) > max(1.0, radius - 4)):
-                        self.finish_spot = self.arena.peek_spot(pos, wounded, center, max(1.0, radius - 4))
-                        self.finish_until = t + 0.5
-                    if self.finish_spot is not None:
-                        return "finish", self.finish_spot, None, 0, False
-        # Once equipped, expose ourselves for a useful pickup or a rotation.
-        # In a shrinking, quiet circle a sheltered edge costs less health (FFA only).
-        equipped = all(me["weapons"]) and me["cubes"] >= 6
-        hold_ground = (self.is_ffa and not threats and 18 < radius < 150 and equipped and value < 0.95)
-        if hold_ground:
-            if self.hold is None or self.hold_until < t or distance(self.hold, center) > radius - 4:
-                self.hold = self.arena.cover(pos, [], center, radius-4)
-                self.hold_until = t + 7
-            if self.hold is not None:
-                return "hold", self.hold, None, 1.25, True
-        if loot:
-            group, obj = loot
-            need_laser = (group == "pickups" and not has_laser and obj.get("kind") == "laser" and zone["radius"] >= 65)
-            easy = distance(pos, obj["pos"]) <= (60 if need_laser else (16 if group == "cubes" else 21))
-            if not threats or (group in ("pickups","cubes","drop") and easy and closest > (22 if need_laser else 16) and value > (0.35 if need_laser else 0.8)):
-                self.remember_goal(loot, obs)
-                if self.recovering and group in ("crates", "npc"):
-                    return "heal", pos, None, 1.5, True
-                if group in ("crates", "npc") and abs(obj["pos"][2] - pos[2]) < 4:
-                    # The pitch limit leaves a blind spot at the mech's feet.
-                    dx, dy = unit(pos[0] - obj["pos"][0], pos[1] - obj["pos"][1])
-                    gap = max(12, me["stats"]["muzzle_height"] * 1.7) + (8 if group == "npc" else 0)
-                    if dx == dy == 0:
-                        dx = 1
-                    vantage = (obj["pos"][0] + gap*dx, obj["pos"][1] + gap*dy)
-                    if self.arena.walkable(*vantage) and distance(vantage, center) < radius:
-                        return "harvest", vantage, obj, 1.0, False
-                return ("capture" if group == "drop" else "loot", obj["pos"],
-                        obj if group in ("crates", "npc") else None,
-                        obj.get("radius", 6) * 0.48 if group == "drop" else 0, self.recovering)
-        if threats:
-            w_by_k = {w["kind"]: w for w in me["weapons"] if w}
-            gw = w_by_k.get("gun")
-            lw = w_by_k.get("laser")
-            ltw = w_by_k.get("lightning")
-            in_light = bool(ltw and closest <= ltw["stats"]["range"] + 4 and me["energy"] >= ltw["stats"]["energy"])
-            dead_window = (not in_light and closest > 45.0 and zone["radius"] > 22
-                           and (gw is None or gw.get("reload", 0.0) > 0.55)
-                           and (lw is None or (lw.get("charge", 0.0) <= 0.0 and lw.get("cooldown", 0.0) > 0.65)))
-            enemy_charging_at_me = (not in_light and closest > 45.0 and zone["radius"] > 22
-                                    and (lw is None or lw.get("charge", 0.0) < 0.45)
-                                    and any(m.get("charging") and math.cos(
-                                        m["aim"][0] - math.atan2(pos[1] - m["pos"][1], pos[0] - m["pos"][0])
-                                    ) > 0.90 for m in threats))
-            laser_peek_duck = (not in_light and lw is not None and lw.get("charge", 0.0) <= 0.0
-                               and lw.get("cooldown", 0.0) > 0.65 and zone["radius"] > 22
-                               and (len(threats) >= 2 or (self.is_ffa and (closest > 135.0 or hp < 0.72)))
-                               and not any(m.get("hp", 1400) <= 350 for m in threats))
-            if dead_window or enemy_charging_at_me or laser_peek_duck:
-                duck = self.protect(pos, threats, zone, t)
-                max_d = 18.0 if dead_window else (14.0 if enemy_charging_at_me else 12.0)
-                if duck is not None and distance(pos, duck) <= max_d:
-                    return "retreat", duck, None, 1.0, False
-            duel_tgt = threats[0]
-            if self.combat.target and self.combat.target.get("kind") == "mech":
-                match_t = next((m for m in threats if m["id"] == self.combat.target["id"]), None)
-                if match_t is not None:
-                    duel_tgt = match_t
-            self.last_duel = (duel_tgt["id"], t, duel_tgt.get("hp", 9999))
-            self.finish_spot = None
-            return "duel", threats[0]["pos"], None, 0, False
-        self.remember_goal(None, obs)
-        if self.recovering:
-            return "heal", pos, None, 1, True
-        if zone["radius"] < 19:
-            return "hold", inside_goal(pos, center, radius * 0.6), None, 0.8, False
-        return "explore", self.explore(obs), None, 0, False
+            yaw = me['aim'][0] + self.sweep_dir*.42
+        action = {'tick':obs['tick'], 'aim':[math.atan2(math.sin(yaw),math.cos(yaw)),0.]}
+        self.combat.engage(obs,object_to_shoot,action)
+        self.feet.move(obs,target,contacts,plan.goal,plan.mode,action)
+        self.equip(obs,contacts,action)
+        choices = (obs.get('offer') or {}).get('choices',())
+        if choices:
+            action['pick'] = self.upgrade(me,choices,obs['zone'])
+        return action
 
     def act(self, obs):
         try:
-            return self._act_inner(obs)
-        except Exception:
-            me = obs.get("self", {})
-            return {"tick": obs.get("tick", 0), "move": [0.0, 0.0], "boost": False, "jump": False,
-                    "aim": list(me.get("aim", [0.0, 0.0])), "fire": [False, False], "reload": False}
-
-    def _act_inner(self, obs):
-        self.arena.set_body(obs["self"]["stats"])
-        self.remember(obs)
-        threats, known = self.threat_list(obs)
-        mode, goal, focus, anchor, quiet = self.plan(obs, threats, known)
-        self.mode = mode
-        action = self.combat.act(obs, self.arena, focus, quiet)
-        primary = self.combat.target
-        if primary is None or primary.get("kind") != "mech":
-            primary = threats[0] if threats else None
-        elif mode == "duel":
-            goal = primary["pos"]
-        pos = obs["self"]["pos"]
-        climbing = False
-        if mode != "duel":
-            if len(goal) == 2 and mode in ("last", "rotate", "hold") and not self.arena.walkable(*goal):
-                # If any nearby ground is inside the destination ring, take it.
-                # A ring entirely above a building instead requires a jet ascent.
-                zone = obs["zone"]
-                radial = min(zone["next_radius"]*0.7, 26)
-                ground_goals = []
-                if radial >= 2:
-                    for j in range(12):
-                        theta = j * math.tau / 12
-                        p = goal[0] + radial * math.cos(theta), goal[1] + radial * math.sin(theta)
-                        if distance(p, zone["next_center"]) < zone["next_radius"] and self.arena.walkable(*p):
-                            ground_goals.append(p)
-                if ground_goals:
-                    goal = min(ground_goals, key=lambda p: distance(pos, p))
-                else:
-                    goal = (*goal, self.arena.roof(*goal))
-            if len(goal) == 3:
-                climbing = (goal[2] > self.arena.ground(*goal[:2]) + 3.8 and (goal[2] > pos[2] + 0.4 or (not obs["self"]["grounded"] and pos[2] < goal[2] + 1.5)))
-        action.update(self.feet.move(obs, self.arena, goal, mode, primary, climbing, anchor))
-        action.update(self.equipment(obs, threats))
-        if obs.get("offer"):
-            pick = self.upgrade(obs)
-            if pick is not None:
-                action["pick"] = pick
-        action["tick"] = obs["tick"]
-        return action
+            return self.decide(obs)
+        except Exception as exc:
+            # Limit diagnostics on the real-time wire. A later good frame can
+            # resume normal play; never replay a stale trigger or pickup.
+            self.errors += 1
+            if self.errors <= 2:
+                print(f"Relay fallback on tick {obs.get('tick')}: {type(exc).__name__}: {exc}",file=sys.stderr)
+            return {'tick':obs.get('tick',0),'move':[0.,0.],'aim':obs.get('self',{}).get('aim',[0.,0.]),
+                    'fire':[False,False],'boost':False,'jump':False}
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     mechfight.run(Bot)
